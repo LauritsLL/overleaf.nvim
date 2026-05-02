@@ -1018,6 +1018,38 @@ function M.compile()
   end)
 end
 
+-- Helper function to check if PDF viewer is open in compiled file. Only works on linux and fallback behavior is just to open file once on compile and then not anymore
+local function is_pdf_open(path)
+  local escaped = vim.fn.shellescape(path)
+  vim.fn.system('lsof ' .. escaped .. ' >/dev/null 2>&1')
+  return vim.v.shell_error == 0
+end
+
+local function supports_lsof_check()
+  local uname = vim.loop.os_uname().sysname
+
+  local os_supported = uname ~= nil and (
+    uname == 'Linux'
+    or uname == 'Darwin'
+    or uname:match('BSD')
+  )
+
+  return os_supported and vim.fn.executable('lsof') == 1
+end
+
+local function should_open_pdf(path)
+  if supports_lsof_check() then
+    return not is_pdf_open(path)
+  end
+
+  if M._state.last_opened_pdf ~= path then
+    M._state.last_opened_pdf = path
+    return true
+  end
+
+  return false
+end
+
 function M._open_pdf(output_files)
   local pdf_file = nil
 
@@ -1044,9 +1076,8 @@ function M._open_pdf(output_files)
     end
 
     vim.schedule(function()
-      if M._state.last_opened_pdf ~= result.path then
+      if should_open_pdf(result.path) then
         open_file(result.path)
-        M._state.last_opened_pdf = result.path
       end
     end)
   end)
