@@ -7,6 +7,9 @@ local sync = require('overleaf.sync')
 
 local M = {}
 
+M._state = M._state or {}
+M._state.last_opened_pdf = nil
+
 --- Open a file with the configured viewer or platform default
 ---@param file_path string
 local function open_file(file_path)
@@ -1017,13 +1020,17 @@ end
 
 function M._open_pdf(output_files)
   local pdf_file = nil
+
   for _, f in ipairs(output_files) do
     if f.path == 'output.pdf' then
       pdf_file = f
       break
     end
   end
-  if not pdf_file or not pdf_file.url then return end
+
+  if not pdf_file or not pdf_file.url then
+    return
+  end
 
   bridge.request('downloadUrl', {
     cookie = config.get().cookie,
@@ -1035,7 +1042,13 @@ function M._open_pdf(output_files)
       config.log('debug', 'PDF download failed: %s', err.message)
       return
     end
-    vim.schedule(function() open_file(result.path) end)
+
+    vim.schedule(function()
+      if M._state.last_opened_pdf ~= result.path then
+        open_file(result.path)
+        M._state.last_opened_pdf = result.path
+      end
+    end)
   end)
 end
 
