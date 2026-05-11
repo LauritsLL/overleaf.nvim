@@ -177,9 +177,11 @@ function Document:rejoin(attempt)
 end
 
 --- Verify that the buffer content matches doc.content.
---- If they diverge (e.g. due to undo-clear side effects or missed events),
---- rejoin to resync from the server.
----@return boolean true if content matches
+--- If they diverge, force a sync (which computes a correct diff op against
+--- the current buffer state) before allowing the flush to proceed. This
+--- handles the race where flush() fires before a pending vim.schedule sync
+--- runs (e.g., during UltiSnips snippet expansion).
+---@return boolean always true (returns false only on hard error)
 function Document:check_content()
   if not self.joined or self._rejoining then return true end
   if not self.bufnr or not vim.api.nvim_buf_is_valid(self.bufnr) then return true end
@@ -189,15 +191,8 @@ function Document:check_content()
   local buf_content = table.concat(lines, '\n')
 
   if buf_content ~= self.content then
-    config.log(
-      'warn',
-      'Content divergence detected in %s (buf=%d, doc=%d bytes) — rejoining',
-      self.path,
-      #buf_content,
-      #self.content
-    )
-    self:rejoin()
-    return false
+    config.log('debug', 'Content divergence in %s — forcing diff sync', self.path)
+    require('overleaf.buffer')._sync(self, self.bufnr)
   end
   return true
 end

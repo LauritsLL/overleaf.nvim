@@ -168,121 +168,153 @@ function M._attach_lsp(bufnr, ft)
   end
 end
 
---- Attach on_bytes listener to buffer for change detection
+--- Attach on_bytes listener to buffer for change detection.
+---
+--- Rather than computing ops from on_bytes' byte_offset arguments (which is
+--- fragile under rapid multi-step edits such as UltiSnips snippet expansion,
+--- where a partial/dropped on_bytes causes doc.content to silently diverge
+--- from the buffer), we defer to vim.schedule and compute a single diff op
+--- from the current buffer state. This coalesces rapid edits into one
+--- correct op and never requires byte_offset arithmetic against a possibly-
+--- stale mirror.
 ---@param bufnr number
 ---@param doc table Document instance
 function M.attach(bufnr, doc)
   vim.api.nvim_buf_attach(bufnr, false, {
-    on_bytes = function(
-      _,
-      buf,
-      _changedtick,
-      start_row,
-      start_col,
-      byte_offset,
-      _old_end_row,
-      _old_end_col,
-      old_end_byte,
-      new_end_row,
-      new_end_col,
-      new_end_byte
-    )
-      -- Guard: ignore changes triggered by applying remote ops
+    on_bytes = function(_, buf)
       if doc.applying_remote then return end
-
-      -- Guard: ignore if document not joined
       if not doc.joined then return end
-
-      local ops = {}
-
-      -- Convert byte offset to character offset for Overleaf protocol
-      local char_offset = ot.byte_to_char(doc.content, byte_offset)
-
-      -- Delete operation
-      if old_end_byte > 0 then
-        local deleted_text = doc.content:sub(byte_offset + 1, byte_offset + old_end_byte)
-        if #deleted_text > 0 then table.insert(ops, { p = char_offset, d = deleted_text }) end
-      end
-
-      -- Insert operation
-      if new_end_byte > 0 then
-        -- Read inserted text from buffer
-        local end_row = start_row + new_end_row
-        local end_col
-        if new_end_row == 0 then
-          end_col = start_col + new_end_col
-        else
-          end_col = new_end_col
-        end
-
-        local ok, new_lines = pcall(vim.api.nvim_buf_get_text, buf, start_row, start_col, end_row, end_col, {})
-        if ok and new_lines then
-          local inserted_text = table.concat(new_lines, '\n')
-          if #inserted_text > 0 then table.insert(ops, { p = char_offset, i = inserted_text }) end
-        end
-      end
-
-      if #ops > 0 then
-        -- Update content mirror
-        doc.content = ot.apply(doc.content, ops)
-        -- Submit to document for OT processing
-        doc:submit_op(ops)
-        -- Sync to disk for external tools
-        require('overleaf.sync').schedule_write(doc)
-      end
+      if doc._sync_scheduled then return end
+      doc._sync_scheduled = true
+      vim.schedule(function() M._sync(doc, buf) end)
     end,
   })
 end
 
---- Apply remote OT operations to a Neovim buffer
+--- Reconcile buffer content with doc.content via diff; submit ops for any change.
+---@param doc table Document instance
+---@param bufnr number
+function M._sync(doc, bufnr)
+  doc._sync_scheduled = false
+
+  if doc.applying_remote then return end
+  if not doc.joined then return end
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then return end
+
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local buf_content = table.concat(lines, '\n')
+
+  if buf_content == doc.content then return end
+
+  local ops = M._diff_ops(doc.content or '', buf_content)
+  doc.content = buf_content
+
+  if #ops > 0 then doc:submit_op(ops) end
+  require('overleaf.sync').schedule_write(doc)
+end
+
+--- Compute a single OT change (one delete + one insert at the same position)
+--- from the byte-level diff of old → new. Finds the longest common UTF-8 safe
+--- prefix and suffix; everything between is the change.
+---@param old string
+---@param new string
+---@return table[] ops list of {p, d?} and/or {p, i?}
+function M._diff_ops(old, new)
+  if old == new then return {} end
+
+  local olen, nlen = #old, #new
+
+  local prefix = 0
+  local min_len = math.min(olen, nlen)
+  while prefix < min_len and old:byte(prefix + 1) == new:byte(prefix + 1) do
+    prefix = prefix + 1
+  end
+  -- UTF-8 safety: don't split a multi-byte character. If the next byte after
+  -- the matching prefix is a continuation byte (10xxxxxx), back up.
+  while prefix > 0 do
+    local b = old:byte(prefix + 1)
+    if b and b >= 0x80 and b < 0xC0 then
+      prefix = prefix - 1
+    else
+      break
+    end
+  end
+
+  local suffix = 0
+  local max_suffix = math.min(olen - prefix, nlen - prefix)
+  while suffix < max_suffix and old:byte(olen - suffix) == new:byte(nlen - suffix) do
+    suffix = suffix + 1
+  end
+  -- UTF-8 safety for suffix: the first byte of the suffix region must not be
+  -- a continuation byte.
+  while suffix > 0 do
+    local b = old:byte(olen - suffix + 1)
+    if b and b >= 0x80 and b < 0xC0 then
+      suffix = suffix - 1
+    else
+      break
+    end
+  end
+
+  local deleted = old:sub(prefix + 1, olen - suffix)
+  local inserted = new:sub(prefix + 1, nlen - suffix)
+
+  local char_p = ot.byte_to_char(old, prefix)
+
+  local ops = {}
+  if #deleted > 0 then table.insert(ops, { p = char_p, d = deleted }) end
+  if #inserted > 0 then table.insert(ops, { p = char_p, i = inserted }) end
+  return ops
+end
+
+--- Apply remote OT operations to a Neovim buffer.
+--- Runs synchronously: callers (bridge event handlers, on_remote_op) are
+--- already in non-fast-event context. Synchronous application keeps
+--- doc.content and the buffer aligned, so the deferred sync diff cannot
+--- observe an intermediate "doc.content has remote, buffer doesn't" state.
 ---@param doc table Document instance
 ---@param ops table[] list of {p, i?, d?}
 function M.apply_remote(doc, ops)
   if not doc.bufnr or not vim.api.nvim_buf_is_valid(doc.bufnr) then return end
 
-  vim.schedule(function()
-    doc.applying_remote = true
+  doc.applying_remote = true
 
-    local had_error = false
+  local had_error = false
 
-    for _, op in ipairs(ops) do
-      local ok, err = pcall(function()
-        if op.d then
-          local all_lines = vim.api.nvim_buf_get_lines(doc.bufnr, 0, -1, false)
-          local buf_content = table.concat(all_lines, '\n')
-          -- Convert character offset to byte offset for Neovim
-          local byte_p = ot.char_to_byte(buf_content, op.p)
-          local start_row, start_col = ot.byte_offset_to_pos(buf_content, byte_p)
-          local end_row, end_col = ot.byte_offset_to_pos(buf_content, byte_p + #op.d)
-          vim.api.nvim_buf_set_text(doc.bufnr, start_row, start_col, end_row, end_col, { '' })
-        end
-        if op.i then
-          local all_lines = vim.api.nvim_buf_get_lines(doc.bufnr, 0, -1, false)
-          local buf_content = table.concat(all_lines, '\n')
-          -- Convert character offset to byte offset for Neovim
-          local byte_p = ot.char_to_byte(buf_content, op.p)
-          local row, col = ot.byte_offset_to_pos(buf_content, byte_p)
-          local insert_lines = vim.split(op.i, '\n', { plain = true })
-          vim.api.nvim_buf_set_text(doc.bufnr, row, col, row, col, insert_lines)
-        end
-      end)
-      if not ok then
-        config.log('error', 'Failed to apply remote op: %s', err)
-        had_error = true
-        break
+  for _, op in ipairs(ops) do
+    local ok, err = pcall(function()
+      if op.d then
+        local all_lines = vim.api.nvim_buf_get_lines(doc.bufnr, 0, -1, false)
+        local buf_content = table.concat(all_lines, '\n')
+        local byte_p = ot.char_to_byte(buf_content, op.p)
+        local start_row, start_col = ot.byte_offset_to_pos(buf_content, byte_p)
+        local end_row, end_col = ot.byte_offset_to_pos(buf_content, byte_p + #op.d)
+        vim.api.nvim_buf_set_text(doc.bufnr, start_row, start_col, end_row, end_col, { '' })
       end
+      if op.i then
+        local all_lines = vim.api.nvim_buf_get_lines(doc.bufnr, 0, -1, false)
+        local buf_content = table.concat(all_lines, '\n')
+        local byte_p = ot.char_to_byte(buf_content, op.p)
+        local row, col = ot.byte_offset_to_pos(buf_content, byte_p)
+        local insert_lines = vim.split(op.i, '\n', { plain = true })
+        vim.api.nvim_buf_set_text(doc.bufnr, row, col, row, col, insert_lines)
+      end
+    end)
+    if not ok then
+      config.log('error', 'Failed to apply remote op: %s', err)
+      had_error = true
+      break
     end
+  end
 
-    -- Fallback: if any op failed, replace buffer entirely from doc.content
-    if had_error and doc.content then
-      config.log('info', 'Falling back to full buffer replace')
-      local new_lines = vim.split(doc.content, '\n', { plain = true })
-      pcall(vim.api.nvim_buf_set_lines, doc.bufnr, 0, -1, false, new_lines)
-    end
+  if had_error and doc.content then
+    config.log('info', 'Falling back to full buffer replace')
+    local new_lines = vim.split(doc.content, '\n', { plain = true })
+    pcall(vim.api.nvim_buf_set_lines, doc.bufnr, 0, -1, false, new_lines)
+  end
 
-    vim.bo[doc.bufnr].modified = false
-    doc.applying_remote = false
-  end)
+  vim.bo[doc.bufnr].modified = false
+  doc.applying_remote = false
 end
 
 --- Run chktex linter on buffer content and report via vim.diagnostic
