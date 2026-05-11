@@ -67,6 +67,23 @@ function M.create(doc, lines)
     txt = 'text',
     md = 'markdown',
   }
+
+  -- Tell VimTeX which file is the project root BEFORE the FileType event fires.
+  -- VimTeX reads b:vimtex_main during its initialisation; setting it here ensures
+  -- multi-file Overleaf projects compile from the correct entry point.
+  if ft_map[ext] == 'tex' then
+    local sync_mod = require('overleaf.sync')
+    if sync_mod._sync_dir then
+      local ol = require('overleaf')
+      local main_entry = ol._get_main_tex_entry and ol._get_main_tex_entry()
+      if main_entry then
+        local main_path = sync_mod._sync_dir .. '/' .. main_entry.path
+        vim.b[bufnr].vimtex_main = main_path
+        config.log('debug', 'vimtex_main = %s', main_path)
+      end
+    end
+  end
+
   if ft_map[ext] then vim.bo[bufnr].filetype = ft_map[ext] end
 
   -- Start syntax highlighting and LSP

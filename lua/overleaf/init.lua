@@ -7,18 +7,13 @@ local sync = require('overleaf.sync')
 
 local M = {}
 
-M._state = M._state or {}
-M._state.last_opened_pdf = nil
-
 --- Open a file with the configured viewer or platform default
 ---@param file_path string
 local function open_file(file_path)
   local viewer = config.get().pdf_viewer
   if viewer then
-    -- User-configured viewer: run as background job to avoid disrupting cursor/window layout
     vim.fn.jobstart({ viewer, file_path }, { detach = true })
   else
-    -- Auto-detect platform launcher (runs in background)
     local cmd
     if vim.fn.has('mac') == 1 then
       cmd = { 'open', file_path }
@@ -42,6 +37,22 @@ M._state = {
 
 function M.setup(opts)
   config.setup(opts)
+
+  -- Set vimtex viewer defaults for okular + synctex if the user hasn't configured them.
+  -- Okular's --unique flag reuses an existing window and supports forward/inverse search.
+  -- For inverse search, configure okular's editor (Settings → Editor) to:
+  --   nvim --headless -c "VimtexInverseSearch %l '%f'"
+  vim.schedule(function()
+    if vim.fn.executable('okular') == 1 then
+      if not vim.g.vimtex_view_method then
+        vim.g.vimtex_view_method = 'general'
+      end
+      if vim.g.vimtex_view_method == 'general' and not vim.g.vimtex_view_general_viewer then
+        vim.g.vimtex_view_general_viewer = 'okular'
+        vim.g.vimtex_view_general_options = '--unique file:@pdf\\#src:@line@tex'
+      end
+    end
+  end)
 
   -- Default keymaps (prefix: <leader>o for Overleaf)
   local keys = opts and opts.keys or true
@@ -994,93 +1005,125 @@ function M.compile()
     return
   end
 
-  config.log('info', 'Compiling...')
-
-  bridge.request('compile', {
-    cookie = config.get().cookie,
-    csrfToken = M._state.csrf_token,
-    projectId = M._state.project_id,
-  }, function(err, result)
-    if err then
-      config.log('error', 'Compile failed: %s', err.message)
-      return
-    end
-
-    if result.status == 'success' then
-      config.log('info', 'Compile succeeded')
-      -- Auto-download and open PDF
-      M._open_pdf(result.outputFiles or {})
-    else
-      config.log('warn', 'Compile status: %s', result.status)
-    end
-
-    vim.schedule(function() M._parse_compile_log(result.log or '') end)
-  end)
-end
-
--- Helper function to check if PDF viewer is open in compiled file. Only works on linux and fallback behavior is just to open file once on compile and then not anymore
-local function is_pdf_open(path)
-  local escaped = vim.fn.shellescape(path)
-  vim.fn.system('lsof ' .. escaped .. ' >/dev/null 2>&1')
-  return vim.v.shell_error == 0
-end
-
-local function supports_lsof_check()
-  local uname = vim.loop.os_uname().sysname
-
-  local os_supported = uname ~= nil and (
-    uname == 'Linux'
-    or uname == 'Darwin'
-    or uname:match('BSD')
-  )
-
-  return os_supported and vim.fn.executable('lsof') == 1
-end
-
-local function should_open_pdf(path)
-  if supports_lsof_check() then
-    return not is_pdf_open(path)
-  end
-
-  if M._state.last_opened_pdf ~= path then
-    M._state.last_opened_pdf = path
-    return true
-  end
-
-  return false
-end
-
-function M._open_pdf(output_files)
-  local pdf_file = nil
-
-  for _, f in ipairs(output_files) do
-    if f.path == 'output.pdf' then
-      pdf_file = f
-      break
-    end
-  end
-
-  if not pdf_file or not pdf_file.url then
+  local sync_mod = require('overleaf.sync')
+  if not sync_mod._sync_dir then
+    config.log('warn', 'Local compile requires sync_dir to be configured in setup().')
     return
   end
 
-  bridge.request('downloadUrl', {
-    cookie = config.get().cookie,
-    url = config.get().base_url .. pdf_file.url,
-    fileName = (M._state.project_name or 'output') .. '.pdf',
-    outputDir = config.get().pdf_dir,
-  }, function(err, result)
-    if err then
-      config.log('debug', 'PDF download failed: %s', err.message)
-      return
-    end
+  M._compile_local()
+end
 
-    vim.schedule(function()
-      if should_open_pdf(result.path) then
-        open_file(result.path)
-      end
-    end)
-  end)
+--- Return the project-tree entry for the root/main .tex file.
+function M._get_main_tex_entry()
+  local proj = require('overleaf.project')
+  local root_id = M._state.project_data and M._state.project_data.rootDoc_id
+  if root_id then
+    local entry = proj.get_doc_by_id(root_id)
+    if entry then return entry end
+  end
+  -- First .tex at root level (no path separator)
+  for _, e in ipairs(proj._project_tree) do
+    if e.type == 'doc' and e.path:match('%.tex$') and not e.path:match('/') then return e end
+  end
+  -- Any .tex file as last resort
+  for _, e in ipairs(proj._project_tree) do
+    if e.type == 'doc' and e.path:match('%.tex$') then return e end
+  end
+  return nil
+end
+
+--- Run latexmk directly on the synced project.
+--- VimTeX is NOT used for compilation to avoid its noisy messages; it is only
+--- used afterwards for VimtexView (forward search via synctex).
+function M._compile_local()
+  local sync_mod = require('overleaf.sync')
+  local sync_dir = sync_mod._sync_dir
+
+  local main_entry = M._get_main_tex_entry()
+  if not main_entry then
+    config.log('error', 'No .tex file found in project')
+    return
+  end
+
+  local main_path = sync_dir .. '/' .. main_entry.path
+  if vim.fn.filereadable(main_path) ~= 1 then
+    config.log('error', 'Main tex file not on disk yet: %s', main_path)
+    return
+  end
+
+  local pdf_path = main_path:gsub('%.tex$', '.pdf')
+  local log_path = main_path:gsub('%.tex$', '.log')
+
+  config.log('info', 'Compiling...')
+
+  vim.fn.jobstart({
+    'latexmk', '-pdf', '-synctex=1', '-interaction=nonstopmode', '-file-line-error', '-cd', main_path,
+  }, {
+    stdout_buffered = true,
+    stderr_buffered = true,
+    on_exit = function(_, code)
+      vim.schedule(function()
+        -- Always parse the log so vim.diagnostic gets updated
+        if vim.fn.filereadable(log_path) == 1 then
+          local f = io.open(log_path, 'r')
+          if f then
+            local text = f:read('*a')
+            f:close()
+            M._parse_compile_log(text)
+          end
+        end
+
+        if code ~= 0 then
+          config.log('warn', 'Compile failed — see diagnostics or check %s', log_path)
+          return
+        end
+
+        config.log('info', 'Compile succeeded')
+
+        if vim.fn.filereadable(pdf_path) ~= 1 then
+          config.log('error', 'PDF not found after compile: %s', pdf_path)
+          return
+        end
+
+        -- Try VimtexView first (handles okular --unique + forward search via synctex).
+        -- VimtexView works as long as b:vimtex is initialised; it doesn't need to have
+        -- done the compilation itself.
+        local view_bufnr = M._find_overleaf_tex_bufnr()
+        if view_bufnr then
+          local has_vimtex = vim.api.nvim_buf_call(view_bufnr, function()
+            return vim.b.vimtex ~= nil
+          end)
+          if has_vimtex then
+            local ok = pcall(function()
+              vim.api.nvim_buf_call(view_bufnr, function()
+                vim.cmd('VimtexView')
+              end)
+            end)
+            if ok then return end
+          end
+        end
+
+        -- Fallback: open okular with --unique so it reuses an existing window
+        vim.fn.jobstart({ 'okular', '--unique', pdf_path }, { detach = true })
+      end)
+    end,
+  })
+end
+
+--- Return the currently active overleaf tex buffer, or any open overleaf tex buffer.
+---@return number|nil bufnr
+function M._find_overleaf_tex_bufnr()
+  local cur = vim.api.nvim_get_current_buf()
+  for _, doc in pairs(M._state.documents) do
+    if doc.bufnr == cur and doc.path:match('%.tex$') then return cur end
+  end
+  for _, doc in pairs(M._state.documents) do
+    if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) and doc.path:match('%.tex$') then
+      return doc.bufnr
+    end
+  end
+  return nil
 end
 
 function M._parse_compile_log(log_text)
