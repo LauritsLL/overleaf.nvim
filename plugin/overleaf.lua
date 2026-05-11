@@ -14,6 +14,7 @@ local subcommands = {
   rename = function() require('overleaf').rename_entity() end,
   upload = function(args) require('overleaf').upload_file(args) end,
   search = function(args) require('overleaf').search(args) end,
+  main = function() require('overleaf').set_main() end,
   comments = function(args)
     if args == 'refresh' then
       require('overleaf').refresh_comments()

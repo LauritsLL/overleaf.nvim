@@ -33,6 +33,7 @@ M._state = {
   project_data = nil,
   csrf_token = nil,
   documents = {}, -- doc_id -> Document
+  main_doc_id_override = nil, -- user-chosen main .tex doc id (session-only)
 }
 
 function M.setup(opts)
@@ -68,6 +69,7 @@ function M.setup(opts)
     map('n', '<leader>oR', function() M.reply_comment() end, { desc = 'Overleaf: Reply to comment' })
     map('n', '<leader>ox', function() M.resolve_comment() end, { desc = 'Overleaf: Resolve/reopen comment' })
     map('n', '<leader>of', function() M.search() end, { desc = 'Overleaf: Find in project' })
+    map('n', '<leader>om', function() M.set_main() end, { desc = 'Overleaf: Set main .tex file' })
   end
 end
 
@@ -1015,8 +1017,15 @@ function M.compile()
 end
 
 --- Return the project-tree entry for the root/main .tex file.
+--- Resolution order: user override (set via :Overleaf set_main / <leader>om)
+--- → project's rootDoc_id → first root-level .tex → any .tex.
 function M._get_main_tex_entry()
   local proj = require('overleaf.project')
+  local override_id = M._state.main_doc_id_override
+  if override_id then
+    local entry = proj.get_doc_by_id(override_id)
+    if entry then return entry end
+  end
   local root_id = M._state.project_data and M._state.project_data.rootDoc_id
   if root_id then
     local entry = proj.get_doc_by_id(root_id)
@@ -1033,9 +1042,167 @@ function M._get_main_tex_entry()
   return nil
 end
 
+--- Update b:vimtex_main on every open Overleaf .tex buffer so VimtexView and
+--- VimTeX's project-aware features pick up the new main file.
+function M._refresh_vimtex_main()
+  local sync_mod = require('overleaf.sync')
+  if not sync_mod._sync_dir then return end
+  local main_entry = M._get_main_tex_entry()
+  if not main_entry then return end
+  local main_path = sync_mod._sync_dir .. '/' .. main_entry.path
+
+  for _, doc in pairs(M._state.documents) do
+    if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) and doc.path:match('%.tex$') then
+      vim.b[doc.bufnr].vimtex_main = main_path
+    end
+  end
+end
+
+--- Set the main .tex file used for compilation. If invoked from the Overleaf
+--- tree sidebar with a .tex entry under the cursor, that entry is used
+--- directly. Otherwise a picker (vim.ui.select) lists every .tex doc in the
+--- project. Honors any user-installed vim.ui.select handler (telescope,
+--- fzf-lua, dressing.nvim, …) automatically.
+function M.set_main()
+  local proj = require('overleaf.project')
+
+  -- If the cursor is in the Overleaf tree on a .tex doc, use it directly.
+  local tree = require('overleaf.tree')
+  local cur_win = vim.api.nvim_get_current_win()
+  if tree._tree_winnr and cur_win == tree._tree_winnr then
+    local line_idx = vim.api.nvim_win_get_cursor(0)[1]
+    local entry = proj._project_tree[line_idx]
+    if entry and entry.type == 'doc' and entry.path:match('%.tex$') then
+      M._apply_main(entry)
+      return
+    end
+  end
+
+  -- Fall back to a picker over all .tex docs.
+  local tex_docs = {}
+  for _, e in ipairs(proj._project_tree) do
+    if e.type == 'doc' and e.path:match('%.tex$') then table.insert(tex_docs, e) end
+  end
+
+  if #tex_docs == 0 then
+    config.log('warn', 'No .tex documents found in project')
+    return
+  end
+
+  vim.ui.select(tex_docs, {
+    prompt = 'Select main .tex file for compilation:',
+    format_item = function(item) return item.path end,
+  }, function(choice)
+    if choice then M._apply_main(choice) end
+  end)
+end
+
+function M._apply_main(entry)
+  M._state.main_doc_id_override = entry.id
+  config.log('info', 'Main .tex set to: %s', entry.path)
+  M._refresh_vimtex_main()
+  pcall(function() require('overleaf.tree').refresh() end)
+end
+
+--- Build the latexmk argv, honoring the user's VimTeX configuration when
+--- present so engine choice (e.g. -xelatex, -lualatex) and other compiler
+--- options carry over. Always ensures an engine flag and -synctex=1 are set
+--- so forward search via VimtexView works regardless of user options.
+---@param main_path string absolute path to the main .tex file
+---@param force boolean|nil if true, pass -g to bust latexmk's "previous run errored" cache
+---@return string[] argv
+function M._build_latexmk_cmd(main_path, force)
+  local cmd = { 'latexmk', '-cd' }
+  if force then table.insert(cmd, '-g') end
+
+  local vt = vim.g.vimtex_compiler_latexmk
+  local options = vt and vt.options
+
+  if type(options) == 'table' and #options > 0 then
+    for _, opt in ipairs(options) do
+      table.insert(cmd, opt)
+    end
+
+    local has_engine, has_synctex, has_fle, has_interaction = false, false, false, false
+    for _, opt in ipairs(options) do
+      if
+        opt == '-pdf'
+        or opt == '-xelatex'
+        or opt == '-pdfxe'
+        or opt == '-lualatex'
+        or opt == '-pdflua'
+        or opt == '-dvi'
+        or opt == '-ps'
+      then
+        has_engine = true
+      end
+      if type(opt) == 'string' and opt:match('^-synctex=') then has_synctex = true end
+      if opt == '-file-line-error' then has_fle = true end
+      if type(opt) == 'string' and opt:match('^-interaction=') then has_interaction = true end
+    end
+    if not has_engine then table.insert(cmd, '-pdf') end
+    if not has_synctex then table.insert(cmd, '-synctex=1') end
+    -- These two options are required for accurate error reporting / parsing.
+    if not has_fle then table.insert(cmd, '-file-line-error') end
+    if not has_interaction then table.insert(cmd, '-interaction=nonstopmode') end
+  else
+    -- Defaults when VimTeX latexmk options aren't configured
+    table.insert(cmd, '-pdf')
+    table.insert(cmd, '-synctex=1')
+    table.insert(cmd, '-interaction=nonstopmode')
+    table.insert(cmd, '-file-line-error')
+  end
+
+  table.insert(cmd, main_path)
+  return cmd
+end
+
+--- Extract the first LaTeX error from a .log file. Recognizes both formats:
+---   1. file-line-error:  "./main.tex:26: Misplaced alignment tab character &."
+---                        (no leading '!' — LaTeX with -file-line-error
+---                        substitutes 'file:line:' for the '!' prefix)
+---   2. classic:          "! Misplaced alignment tab character &."  with
+---                        "l.26 ..." on a later line.
+--- Skips obvious non-errors (LaTeX/Package Warning/Info lines).
+---@param log_text string full contents of main.log
+---@return string|nil
+function M._first_latex_error(log_text)
+  if not log_text or #log_text == 0 then return nil end
+  local lines = vim.split(log_text, '\n', { plain = true })
+  for i, line in ipairs(lines) do
+    -- FLE format: <file>:<line>: <message>
+    local fle_file, fle_lnum, fle_msg = line:match('^(%S+%.%a+):(%d+):%s*(.+)$')
+    if fle_file and fle_lnum and fle_msg and not fle_msg:match('^%s*$') then
+      -- Skip warnings/info that also use FLE-like prefixes
+      local lower = fle_msg:lower()
+      if not lower:match('^warning') and not lower:match('^info') then
+        return string.format('%s:%s: %s', fle_file, fle_lnum, fle_msg)
+      end
+    end
+
+    -- Classic format: "! <message>" then "l.<num>" a few lines later
+    if line:match('^!') then
+      local msg = line:sub(3)
+      local lnum
+      for j = i + 1, math.min(i + 8, #lines) do
+        local n = lines[j]:match('^l%.(%d+)')
+        if n then
+          lnum = n
+          break
+        end
+      end
+      if lnum then return string.format('line %s: %s', lnum, msg) end
+      return msg
+    end
+  end
+  return nil
+end
+
 --- Run latexmk directly on the synced project.
 --- VimTeX is NOT used for compilation to avoid its noisy messages; it is only
---- used afterwards for VimtexView (forward search via synctex).
+--- used afterwards for VimtexView (forward search via synctex). The latexmk
+--- argv is derived from g:vimtex_compiler_latexmk.options when available so
+--- the user's choice of engine (xelatex/lualatex/etc.) is respected.
 function M._compile_local()
   local sync_mod = require('overleaf.sync')
   local sync_dir = sync_mod._sync_dir
@@ -1057,58 +1224,117 @@ function M._compile_local()
 
   config.log('info', 'Compiling...')
 
-  vim.fn.jobstart({
-    'latexmk', '-pdf', '-synctex=1', '-interaction=nonstopmode', '-file-line-error', '-cd', main_path,
-  }, {
-    stdout_buffered = true,
-    stderr_buffered = true,
-    on_exit = function(_, code)
-      vim.schedule(function()
-        -- Always parse the log so vim.diagnostic gets updated
-        if vim.fn.filereadable(log_path) == 1 then
-          local f = io.open(log_path, 'r')
-          if f then
-            local text = f:read('*a')
-            f:close()
-            M._parse_compile_log(text)
+  local function attempt(force)
+    -- Capture latexmk output so failures are diagnosable. We treat success as
+    -- "the .pdf is fresh on disk after the run" rather than "exit code == 0",
+    -- because latexmk can exit non-zero even when xelatex+xdvipdfmx produced
+    -- a valid PDF (e.g. due to harmless warnings, certain rc-file callbacks,
+    -- or non-fatal rerun-checks).
+    local pre_mtime = vim.fn.filereadable(pdf_path) == 1 and vim.fn.getftime(pdf_path) or -1
+    local stderr_buf = {}
+    local stdout_buf = {}
+
+    vim.fn.jobstart(M._build_latexmk_cmd(main_path, force), {
+      stdout_buffered = true,
+      stderr_buffered = true,
+      on_stdout = function(_, data) if data then vim.list_extend(stdout_buf, data) end end,
+      on_stderr = function(_, data) if data then vim.list_extend(stderr_buf, data) end end,
+      on_exit = function(_, code)
+        vim.schedule(function()
+          -- Always parse the log so vim.diagnostic gets updated
+          local log_text = nil
+          if vim.fn.filereadable(log_path) == 1 then
+            local f = io.open(log_path, 'r')
+            if f then
+              log_text = f:read('*a')
+              f:close()
+              M._parse_compile_log(log_text)
+            end
           end
-        end
 
-        if code ~= 0 then
-          config.log('warn', 'Compile failed — see diagnostics or check %s', log_path)
-          return
-        end
+          local pdf_mtime = vim.fn.filereadable(pdf_path) == 1 and vim.fn.getftime(pdf_path) or -1
+          local pdf_fresh = pdf_mtime > pre_mtime
+          local pdf_exists = pdf_mtime > 0
 
-        config.log('info', 'Compile succeeded')
+          if not pdf_exists or not pdf_fresh then
+            -- Detect latexmk's "stuck cache" state: it remembers a previous
+            -- error and refuses to rerun because nothing changed in the
+            -- sources. We auto-retry once with -g to bust that cache.
+            local stdout_text = table.concat(stdout_buf, '\n')
+            local stuck = stdout_text:match('Nothing to do')
+              and stdout_text:match('previous invocation')
+            if stuck and not force then
+              config.log('info', 'latexmk cached a previous error — forcing rebuild...')
+              attempt(true)
+              return
+            end
 
-        if vim.fn.filereadable(pdf_path) ~= 1 then
-          config.log('error', 'PDF not found after compile: %s', pdf_path)
-          return
-        end
+            local headline = pdf_exists and 'PDF was not updated' or 'no PDF produced'
+            config.log(
+              'warn',
+              'Compile failed (%s, exit=%d) — see :Overleaf diagnostics in editor or check %s',
+              headline,
+              code,
+              log_path
+            )
 
-        -- Try VimtexView first (handles okular --unique + forward search via synctex).
-        -- VimtexView works as long as b:vimtex is initialised; it doesn't need to have
-        -- done the compilation itself.
-        local view_bufnr = M._find_overleaf_tex_bufnr()
-        if view_bufnr then
-          local has_vimtex = vim.api.nvim_buf_call(view_bufnr, function()
-            return vim.b.vimtex ~= nil
-          end)
-          if has_vimtex then
-            local ok = pcall(function()
-              vim.api.nvim_buf_call(view_bufnr, function()
-                vim.cmd('VimtexView')
-              end)
+            -- Surface the first LaTeX error from the log so the user sees
+            -- the actual cause immediately rather than having to scan the
+            -- log themselves. Diagnostics are also already set on buffers.
+            local first_err = M._first_latex_error(log_text or '')
+            if first_err then config.log('warn', 'LaTeX error: %s', first_err) end
+
+            return
+          end
+
+          if code ~= 0 then
+            config.log('info', 'Compile finished with warnings (exit=%d), PDF updated', code)
+          else
+            config.log('info', 'Compile succeeded')
+          end
+
+          -- Try VimtexView first (handles okular --unique + forward search via synctex).
+          -- VimtexView works as long as b:vimtex is initialised; it doesn't need to have
+          -- done the compilation itself.
+          local view_bufnr = M._find_overleaf_tex_bufnr()
+          if view_bufnr then
+            local has_vimtex = vim.api.nvim_buf_call(view_bufnr, function()
+              return vim.b.vimtex ~= nil
             end)
-            if ok then return end
+            if has_vimtex then
+              local ok = pcall(function()
+                vim.api.nvim_buf_call(view_bufnr, function()
+                  vim.cmd('VimtexView')
+                end)
+              end)
+              if ok then return end
+            end
           end
-        end
 
-        -- Fallback: open okular with --unique so it reuses an existing window
-        vim.fn.jobstart({ 'okular', '--unique', pdf_path }, { detach = true })
-      end)
-    end,
-  })
+          -- Fallback: open okular with --unique so it reuses an existing window
+          vim.fn.jobstart({ 'okular', '--unique', pdf_path }, { detach = true })
+        end)
+      end,
+    })
+  end
+
+  attempt(false)
+end
+
+--- Take the last `n` non-empty lines of a list of strings, joined by '\n'.
+---@param lines string[]
+---@param n number
+---@return string
+function M._tail_lines(lines, n)
+  local out = {}
+  for i = #lines, 1, -1 do
+    local s = lines[i]
+    if s and s ~= '' then
+      table.insert(out, 1, s)
+      if #out >= n then break end
+    end
+  end
+  return table.concat(out, '\n')
 end
 
 --- Return the currently active overleaf tex buffer, or any open overleaf tex buffer.
@@ -1171,7 +1397,31 @@ function M._parse_compile_log(log_text)
       end
     end
 
-    -- Match LaTeX errors: lines starting with "!"
+    -- Match LaTeX errors in file-line-error format:
+    --   ./main.tex:26: Misplaced alignment tab character &.
+    -- (no leading "!" — LaTeX with -file-line-error substitutes file:line:
+    -- for the "!" prefix.) Skip Warning/Info lines that share the prefix.
+    do
+      local fle_file, fle_lnum, fle_msg = line:match('^(%S+%.%a+):(%d+):%s*(.+)$')
+      if fle_file and fle_lnum and fle_msg and not fle_msg:match('^%s*$') then
+        local lower = fle_msg:lower()
+        if not lower:match('^warning') and not lower:match('^info') then
+          local doc = path_to_doc[fle_file] or path_to_doc[fle_file:match('[^/]+$') or '']
+          if doc then
+            diagnostics[doc.bufnr] = diagnostics[doc.bufnr] or {}
+            table.insert(diagnostics[doc.bufnr], {
+              lnum = tonumber(fle_lnum) - 1,
+              col = 0,
+              severity = vim.diagnostic.severity.ERROR,
+              message = fle_msg,
+              source = 'latex',
+            })
+          end
+        end
+      end
+    end
+
+    -- Match LaTeX errors in classic format: lines starting with "!"
     if line:match('^!') then
       local msg = line:sub(3) -- strip "! "
       local lnum = 0

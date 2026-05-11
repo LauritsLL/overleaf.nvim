@@ -77,6 +77,7 @@ function M._ensure_buffer()
   vim.keymap.set('n', 'd', function() M._delete_entry() end, { buffer = M._bufnr, desc = 'Delete' })
   vim.keymap.set('n', 'r', function() M._rename_entry() end, { buffer = M._bufnr, desc = 'Rename' })
   vim.keymap.set('n', 'u', function() M._upload_file() end, { buffer = M._bufnr, desc = 'Upload file' })
+  vim.keymap.set('n', 'm', function() require('overleaf').set_main() end, { buffer = M._bufnr, desc = 'Set main .tex' })
 end
 
 --- Refresh the tree display
@@ -87,6 +88,11 @@ function M.refresh()
   local lines = {}
   local ns = vim.api.nvim_create_namespace('overleaf_tree_hl')
 
+  -- Identify the current main .tex doc so we can mark it in the listing.
+  local ok_ol, ol = pcall(require, 'overleaf')
+  local main_entry = ok_ol and ol._get_main_tex_entry and ol._get_main_tex_entry() or nil
+  local main_id = main_entry and main_entry.id or nil
+
   for _, entry in ipairs(tree) do
     local indent = string.rep('  ', entry.depth or 0)
     local icon, line
@@ -95,7 +101,8 @@ function M.refresh()
       line = indent .. icon .. entry.name .. '/'
     elseif entry.type == 'doc' then
       icon = '  '
-      line = indent .. icon .. entry.name
+      local marker = (entry.id == main_id) and ' ★' or ''
+      line = indent .. icon .. entry.name .. marker
     else -- file
       icon = '  '
       line = indent .. icon .. entry.name
