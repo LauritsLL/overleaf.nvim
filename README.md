@@ -11,7 +11,9 @@ Edit your Overleaf projects directly in Neovim with full real-time collaboration
 - **File tree** — browse and manage project files in a sidebar
 - **Auto-authentication** — extracts session cookie from Chrome automatically (macOS)
 - **Auto-reconnect** — recovers from disconnects and document restores seamlessly
-- **Compile & PDF preview** — compile LaTeX and open the PDF
+- **Local LaTeX compilation** — compile with latexmk directly on synced files, with XeLaTeX support and optional compile-on-write
+- **PDF preview with inverse search** — forward and inverse search support in Okular for seamless navigation
+- **Smart PDF viewer** — tracks viewer state and only opens the window once per compile
 - **Comments & reviews** — view, reply, resolve comment threads
 - **Collaborator cursors** — see where other users are editing
 - **Project-wide search** — grep across all documents
@@ -20,6 +22,7 @@ Edit your Overleaf projects directly in Neovim with full real-time collaboration
 - **Diagnostics** — chktex linter + LaTeX compile errors via `vim.diagnostic`
 - **LSP support** — auto-attaches texlab, ltex, harper_ls to overleaf buffers
 - **Local file sync** — mirror documents to disk for external tools (Claude Code, etc.)
+- **Multi-file project support** — automatic main file detection and configuration
 
 ## Requirements
 
@@ -158,25 +161,45 @@ require('overleaf').setup({
   -- Path to Node.js binary (default: 'node')
   node_path = 'node',
 
+  -- Overleaf instance URL (default: 'https://www.overleaf.com')
+  base_url = 'https://www.overleaf.com',
+
+  -- PDF viewer command (nil = auto-detect: 'open' on macOS, 'xdg-open' on Linux)
+  pdf_viewer = nil,
+
+  -- PDF output directory (nil = system temp directory)
+  pdf_dir = nil,
+
+  -- Local file sync directory for external tools and local compilation (default: nil = disabled)
+  -- When set: all documents are mirrored to disk, latexmk compiles locally, and external changes sync back
+  sync_dir = '~/.overleaf',
+
   -- Log level: 'debug', 'info', 'warn', 'error' (default: 'info')
   log_level = 'info',
-
-  -- Local file sync directory for external tools like Claude Code (default: nil = disabled)
-  -- When set, all documents are mirrored to disk and external changes are synced back.
-  sync_dir = '~/.overleaf',
 
   -- Set to false to disable default keymaps
   keys = true,
 })
 ```
 
+### Okular Inverse Search Setup
+
+To enable inverse search (Shift+Click in PDF to jump to source), configure Okular's editor:
+
+1. Open Okular → Settings → Editor
+2. Set Command to: `nvim --remote-expr "OlInverseSearch('{file}',{line})"`
+3. Save and restart Okular
+
+The plugin auto-configures Okular as the vimtex viewer with synctex support when compilation is enabled.
+
 ## Workflow
 
 1. `:Overleaf` — authenticate and select a project
 2. File tree appears — press `Enter` to open a document
 3. Edit normally — changes sync to Overleaf in real-time
-4. `:w` — triggers compile and opens PDF
-5. `:Overleaf tree` — switch between documents
+4. `:w` — triggers local compilation (if sync_dir is enabled) and opens PDF in Okular
+5. Use Okular's inverse search (Shift+Left-Click) to jump back to Neovim at a specific PDF location
+6. `:Overleaf tree` — switch between documents
 
 ## External Tool Integration (Claude Code, etc.)
 
@@ -220,6 +243,8 @@ Claude Code can now read all your LaTeX files and make edits that sync back to O
 ## How It Works
 
 The plugin spawns a Node.js bridge process that connects to Overleaf's real-time collaboration server via Socket.IO. Edits in Neovim are converted to OT operations and sent to the server. Remote edits from other collaborators are transformed and applied to your buffer in real-time.
+
+When `sync_dir` is enabled, documents are mirrored to disk and compilation runs locally with latexmk, supporting pdfTeX, XeLaTeX, and LuaTeX. Changes from external tools or other users are automatically detected and synced bidirectionally. Compilation results are shown via vim.diagnostic, and Okular's forward and inverse search integrate with vimtex for seamless PDF navigation.
 
 ## Disclaimer
 
