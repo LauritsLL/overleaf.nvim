@@ -37,7 +37,7 @@ Edit your Overleaf projects directly in Neovim with full real-time collaboration
 
 ```lua
 {
-  'richwomanbtc/overleaf.nvim',
+  'LauritsLL/overleaf.nvim',
   config = function()
     require('overleaf').setup()
   end,
@@ -49,7 +49,7 @@ If Node.js is not on your default PATH (e.g., installed via Homebrew on macOS):
 
 ```lua
 {
-  'richwomanbtc/overleaf.nvim',
+  'LauritsLL/overleaf.nvim',
   config = function()
     require('overleaf').setup({
       node_path = '/opt/homebrew/bin/node',
@@ -62,7 +62,7 @@ If Node.js is not on your default PATH (e.g., installed via Homebrew on macOS):
 ### Manual
 
 ```sh
-git clone https://github.com/richwomanbtc/overleaf.nvim ~/.local/share/nvim/lazy/overleaf.nvim
+git clone https://github.com/LauritsLL/overleaf.nvim ~/.local/share/nvim/lazy/overleaf.nvim
 cd ~/.local/share/nvim/lazy/overleaf.nvim/node && npm install
 ```
 
