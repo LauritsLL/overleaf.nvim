@@ -7,8 +7,40 @@ local M = {}
 
 M._sync_dir = nil
 M._watchers = {} -- path -> {handle, doc_id}
-M._write_timers = {} -- doc_id -> timer
+M._write_timers = {} -- doc_id -> {timer, doc}
 M._writing = {} -- path -> true (suppress watcher during our writes)
+
+--- Write `content` to `path` atomically: write a sibling temp file, then
+--- rename it over the target. rename(2) is atomic within a filesystem, so a
+--- concurrent reader — e.g. latexmk/xelatex/xdvipdfmx during a compile, or an
+--- external editor — observes either the old file or the complete new one,
+--- never a half-written one. (A torn .tex/.bib/image read by xelatex+xdvipdfmx
+--- is a classic source of a valid .xdv but a corrupt .pdf.) Falls back to a
+--- plain write if the temp file or the rename can't be created.
+---@param path string
+---@param content string binary-safe
+local function atomic_write(path, content)
+  local tmp = path .. '.overleaf-tmp'
+  local f = io.open(tmp, 'wb')
+  if not f then
+    local g = io.open(path, 'wb')
+    if g then
+      g:write(content)
+      g:close()
+    end
+    return
+  end
+  f:write(content)
+  f:close()
+  if not os.rename(tmp, path) then
+    os.remove(tmp)
+    local g = io.open(path, 'wb')
+    if g then
+      g:write(content)
+      g:close()
+    end
+  end
+end
 
 --- Start sync for a project. Creates the sync directory.
 ---@param project_name string
@@ -36,8 +68,8 @@ function M.stop()
   end
   M._watchers = {}
 
-  for _, timer in pairs(M._write_timers) do
-    vim.fn.timer_stop(timer)
+  for _, entry in pairs(M._write_timers) do
+    vim.fn.timer_stop(entry.timer)
   end
   M._write_timers = {}
 
@@ -87,11 +119,12 @@ function M.write_doc(doc)
   -- Set writing flag to suppress watcher
   M._writing[path] = true
 
-  local f = io.open(path, 'w')
-  if f then
-    f:write(doc.content)
-    f:close()
-  end
+  atomic_write(path, doc.content)
+
+  -- The atomic rename swaps in a new inode, so any fs_event watch bound to the
+  -- old one is now dead — re-arm it on the new file so external edits are still
+  -- picked up.
+  if M._watchers[path] then M.watch(doc) end
 
   -- Clear writing flag after watcher event has passed
   vim.defer_fn(function() M._writing[path] = nil end, 300)
@@ -102,12 +135,26 @@ end
 function M.schedule_write(doc)
   if not M._sync_dir then return end
 
-  if M._write_timers[doc.doc_id] then vim.fn.timer_stop(M._write_timers[doc.doc_id]) end
+  local existing = M._write_timers[doc.doc_id]
+  if existing then vim.fn.timer_stop(existing.timer) end
 
-  M._write_timers[doc.doc_id] = vim.fn.timer_start(500, function()
+  local timer = vim.fn.timer_start(500, function()
     M._write_timers[doc.doc_id] = nil
     M.write_doc(doc)
   end)
+  M._write_timers[doc.doc_id] = { timer = timer, doc = doc }
+end
+
+--- Run every pending debounced write right now. Call before kicking off a
+--- compile so the build sees the current source and no write fires mid-build.
+function M.flush_pending_writes()
+  if not M._sync_dir then return end
+  local pending = M._write_timers
+  M._write_timers = {}
+  for _, entry in pairs(pending) do
+    vim.fn.timer_stop(entry.timer)
+    M.write_doc(entry.doc)
+  end
 end
 
 --- Start watching a file for external changes
@@ -246,7 +293,10 @@ function M._download_file(entry, project_id)
     fileName = entry.name,
   }, function(err, result)
     if err then
-      config.log('debug', 'Download skip %s: %s', entry.path, err.message)
+      -- A missing binary (image/PDF/font) makes the build fail in a confusing
+      -- way later — xelatex still emits a .xdv, then xdvipdfmx can't embed the
+      -- graphic and leaves a corrupt .pdf — so make this visible, not debug.
+      config.log('warn', 'Could not download %s: %s', entry.path, err.message)
       return
     end
 
@@ -254,20 +304,29 @@ function M._download_file(entry, project_id)
     local src = result.path
     local ok, copy_err = pcall(function()
       local src_f = io.open(src, 'rb')
-      if not src_f then error('Cannot read ' .. src) end
+      if not src_f then error('cannot read downloaded file ' .. tostring(src)) end
       local data = src_f:read('*a')
       src_f:close()
 
-      local dest_f = io.open(dest, 'wb')
-      if not dest_f then error('Cannot write ' .. dest) end
-      dest_f:write(data)
-      dest_f:close()
+      -- Guard against the API handing us an error/login HTML page (stale cookie)
+      -- or an empty body instead of the actual binary: writing that as foo.pdf
+      -- would make xdvipdfmx choke and produce a corrupt PDF.
+      if not data or #data == 0 then error('downloaded file is empty') end
+      local sniff = data:sub(1, 64):lower()
+      if sniff:match('^%s*<!doctype html') or sniff:match('^%s*<html') then
+        error('server returned an HTML page, not the file (cookie expired?)')
+      end
+
+      -- Atomic: a compile must never read a half-copied file — xelatex emits
+      -- the .xdv fine without it, but xdvipdfmx then chokes embedding the
+      -- truncated file and leaves a corrupt .pdf.
+      atomic_write(dest, data)
     end)
 
     if ok then
       config.log('debug', 'Downloaded: %s', entry.path)
     else
-      config.log('debug', 'Copy failed %s: %s', entry.path, tostring(copy_err))
+      config.log('warn', 'Download failed for %s: %s', entry.path, tostring(copy_err))
     end
   end)
 end
