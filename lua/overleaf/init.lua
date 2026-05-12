@@ -7,22 +7,20 @@ local sync = require('overleaf.sync')
 
 local M = {}
 
---- Open a file with the configured viewer or platform default
+--- Open a file with the configured viewer or platform default (only if not already open)
 ---@param file_path string
 local function open_file(file_path)
-  local viewer = config.get().pdf_viewer
-  if viewer then
+  -- Check if okular is already running
+  local pgrep_output = vim.fn.system('pgrep okular')
+  local okular_running = (pgrep_output ~= '' and vim.v.shell_error == 0)
+  config.log('debug', 'okular running check: output=%s error=%d', pgrep_output:gsub('\n', ''), vim.v.shell_error)
+
+  if not okular_running then
+    local viewer = config.get().pdf_viewer or 'okular'
+    config.log('debug', 'Opening PDF with viewer: %s', viewer)
     vim.fn.jobstart({ viewer, file_path }, { detach = true })
   else
-    local cmd
-    if vim.fn.has('mac') == 1 then
-      cmd = { 'open', file_path }
-    elseif vim.fn.has('wsl') == 1 then
-      cmd = { 'wslview', file_path }
-    else
-      cmd = { 'xdg-open', file_path }
-    end
-    vim.fn.system(cmd)
+    config.log('debug', 'okular already running, skipping open')
   end
 end
 
@@ -35,6 +33,15 @@ M._state = {
   documents = {}, -- doc_id -> Document
   main_doc_id_override = nil, -- user-chosen main .tex doc id (session-only)
 }
+
+-- Latexmk job for the in-flight compile, if any. Two latexmk runs in the same
+-- directory race over the intermediate files: with XeLaTeX the second run's
+-- `xelatex -no-pdf` truncates main.xdv while the first run's `xdvipdfmx` is
+-- still reading it (and both runs' xdvipdfmx write main.pdf at once), which
+-- leaves a perfectly fine main.xdv but a corrupt, unopenable main.pdf. Larger
+-- projects compile slowly enough for a second :w / :Overleaf compile to land
+-- inside that window, so M.compile() refuses to start one while another runs.
+M._compile_job = nil
 
 function M.setup(opts)
   config.setup(opts)
@@ -1013,6 +1020,13 @@ function M.compile()
     return
   end
 
+  -- jobwait(..., 0): -1 means the job is still running; anything else (an exit
+  -- code, or -3 for an unknown id) means it has finished, so we're free to go.
+  if M._compile_job and vim.fn.jobwait({ M._compile_job }, 0)[1] == -1 then
+    config.log('info', 'A compile is already running — re-run :Overleaf compile when it finishes')
+    return
+  end
+
   M._compile_local()
 end
 
@@ -1115,6 +1129,19 @@ function M._build_latexmk_cmd(main_path, force)
   local cmd = { 'latexmk', '-cd' }
   if force then table.insert(cmd, '-g') end
 
+  -- XeLaTeX builds the PDF in two steps: `xelatex -no-pdf` → main.xdv, then
+  -- xdvipdfmx → main.pdf. xdvipdfmx defaults to emitting a PDF 1.5 file, and if
+  -- the document \includegraphics a newer PDF (1.7 — common: anything exported
+  -- from a recent tool), xdvipdfmx bails partway with
+  --   "Trying to include PDF file with version (1.7) ... newer than ... (1.5)"
+  --   "Didn't find \"endobj\"" / "pdf_link_obj(): passed invalid object"
+  -- leaving a truncated, unopenable main.pdf. (Overleaf's own xelatex doesn't
+  -- hit this — it runs with a higher output version.) Raise xdvipdfmx's output
+  -- PDF version to 1.7 unless something already set one. This is a no-op for
+  -- non-xelatex engines, where $xdvipdfmx is never invoked.
+  table.insert(cmd, '-e')
+  table.insert(cmd, [[$xdvipdfmx =~ s/^\s*(\S+)/$1 -V 7/ unless $xdvipdfmx =~ / -V /;]])
+
   local vt = vim.g.vimtex_compiler_latexmk
   local options = vt and vt.options
 
@@ -1198,6 +1225,30 @@ function M._first_latex_error(log_text)
   return nil
 end
 
+--- Cheap structural check that `path` is a complete PDF: it must begin with the
+--- "%PDF-" signature and the trailing bytes must contain the "%%EOF" marker.
+--- A PDF that fails this is truncated — e.g. xdvipdfmx aborted partway through
+--- (font/graphics error on a complex document) or a second compile clobbered
+--- the file. Such a PDF is non-empty but cannot be opened, so we must not pass
+--- it off as a successful build.
+---@param path string
+---@return boolean
+function M._pdf_looks_valid(path)
+  local f = io.open(path, 'rb')
+  if not f then return false end
+  local head = f:read(5)
+  if head ~= '%PDF-' then
+    f:close()
+    return false
+  end
+  local size = f:seek('end') or 0
+  local tail_len = math.min(size, 2048)
+  f:seek('end', -tail_len)
+  local tail = f:read(tail_len) or ''
+  f:close()
+  return tail:find('%%EOF', 1, true) ~= nil
+end
+
 --- Run latexmk directly on the synced project.
 --- VimTeX is NOT used for compilation to avoid its noisy messages; it is only
 --- used afterwards for VimtexView (forward search via synctex). The latexmk
@@ -1206,6 +1257,13 @@ end
 function M._compile_local()
   local sync_mod = require('overleaf.sync')
   local sync_dir = sync_mod._sync_dir
+  if not sync_dir then return end
+
+  -- Land every debounced disk write before handing the tree to latexmk so the
+  -- compile reads current source — and so a write can't fire mid-compile,
+  -- changing a source file's mtime under xelatex/xdvipdfmx and corrupting the
+  -- intermediate files it is in the middle of reading.
+  sync_mod.flush_pending_writes()
 
   local main_entry = M._get_main_tex_entry()
   if not main_entry then
@@ -1221,25 +1279,29 @@ function M._compile_local()
 
   local pdf_path = main_path:gsub('%.tex$', '.pdf')
   local log_path = main_path:gsub('%.tex$', '.log')
+  -- latexmk's own console transcript (distinct from main.log) — this is where
+  -- the .xdv→.pdf driver reports, so a failed build dumps it here.
+  local build_log_path = main_path:gsub('%.tex$', '.latexmk-output.log')
 
   config.log('info', 'Compiling...')
 
   local function attempt(force)
     -- Capture latexmk output so failures are diagnosable. We treat success as
-    -- "the .pdf is fresh on disk after the run" rather than "exit code == 0",
-    -- because latexmk can exit non-zero even when xelatex+xdvipdfmx produced
-    -- a valid PDF (e.g. due to harmless warnings, certain rc-file callbacks,
-    -- or non-fatal rerun-checks).
+    -- "the .pdf is fresh on disk AND structurally complete after the run"
+    -- rather than "exit code == 0", because latexmk can exit non-zero even
+    -- when xelatex+xdvipdfmx produced a valid PDF (e.g. harmless warnings,
+    -- certain rc-file callbacks, or non-fatal rerun-checks).
     local pre_mtime = vim.fn.filereadable(pdf_path) == 1 and vim.fn.getftime(pdf_path) or -1
     local stderr_buf = {}
     local stdout_buf = {}
 
-    vim.fn.jobstart(M._build_latexmk_cmd(main_path, force), {
+    local job = vim.fn.jobstart(M._build_latexmk_cmd(main_path, force), {
       stdout_buffered = true,
       stderr_buffered = true,
       on_stdout = function(_, data) if data then vim.list_extend(stdout_buf, data) end end,
       on_stderr = function(_, data) if data then vim.list_extend(stderr_buf, data) end end,
-      on_exit = function(_, code)
+      on_exit = function(job_id, code)
+        if M._compile_job == job_id then M._compile_job = nil end
         vim.schedule(function()
           -- Always parse the log so vim.diagnostic gets updated
           local log_text = nil
@@ -1250,6 +1312,62 @@ function M._compile_local()
               f:close()
               M._parse_compile_log(log_text)
             end
+          end
+
+          -- latexmk relays the xelatex *and* the xdvipdfmx (.xdv→.pdf) output on
+          -- its own stdout/stderr — NOT into main.log — so when xdvipdfmx is the
+          -- one that failed (can't find/embed a graphic or font, needs
+          -- shell-escape, …) the cause is only visible there. Persist the full
+          -- transcript next to main.log and surface the lines that look like the
+          -- actual complaint, plus the first error from main.log.
+          local transcript = {}
+          vim.list_extend(transcript, stdout_buf)
+          vim.list_extend(transcript, stderr_buf)
+
+          local function report_failure(headline)
+            local saved = false
+            local bf = io.open(build_log_path, 'w')
+            if bf then
+              bf:write(table.concat(transcript, '\n'))
+              bf:close()
+              saved = true
+            end
+
+            config.log(
+              'warn',
+              'Compile failed (%s, exit=%d) — see :Overleaf diagnostics, %s%s',
+              headline,
+              code,
+              log_path,
+              saved and (' and ' .. build_log_path) or ''
+            )
+
+            local first_err = M._first_latex_error(log_text or '')
+            if first_err then config.log('warn', 'LaTeX error: %s', first_err) end
+
+            local hits = {}
+            for _, line in ipairs(transcript) do
+              if
+                line:match('xdvipdfmx')
+                or line:match('dvipdfm')
+                or line:match('[Ff]atal')
+                or line:match('^!')
+                or line:match('[Cc]ould not find')
+                or line:match('[Nn]ot found')
+                or line:match('shell%-escape')
+                or line:match('[Ee]rror:')
+              then
+                hits[#hits + 1] = line
+              end
+            end
+            if #hits == 0 then
+              local tail = M._tail_lines(transcript, 8)
+              if tail ~= '' then hits = vim.split(tail, '\n', { plain = true }) end
+            end
+            while #hits > 12 do
+              table.remove(hits, 1)
+            end
+            if #hits > 0 then config.log('warn', 'latexmk output:\n  %s', table.concat(hits, '\n  ')) end
           end
 
           local pdf_mtime = vim.fn.filereadable(pdf_path) == 1 and vim.fn.getftime(pdf_path) or -1
@@ -1269,23 +1387,21 @@ function M._compile_local()
               return
             end
 
-            local headline = pdf_exists and 'PDF was not updated' or 'no PDF produced'
-            config.log(
-              'warn',
-              'Compile failed (%s, exit=%d) — see :Overleaf diagnostics in editor or check %s',
-              headline,
-              code,
-              log_path
-            )
-
-            -- Surface the first LaTeX error from the log so the user sees
-            -- the actual cause immediately rather than having to scan the
-            -- log themselves. Diagnostics are also already set on buffers.
-            local first_err = M._first_latex_error(log_text or '')
-            if first_err then config.log('warn', 'LaTeX error: %s', first_err) end
-
+            report_failure(pdf_exists and 'PDF was not updated' or 'no PDF produced')
             return
           end
+
+          -- A fresh PDF is on disk, but the XeLaTeX .xdv→.pdf step (xdvipdfmx)
+          -- may have aborted partway — common on larger documents (a font or
+          -- graphics it can't embed) — or a parallel build clobbered the file.
+          -- The result is a non-empty but truncated PDF that won't open: refuse
+          -- to report it as a successful build, and don't open it in the viewer.
+          if not M._pdf_looks_valid(pdf_path) then
+            report_failure('PDF is truncated/corrupt')
+            return
+          end
+
+          os.remove(build_log_path) -- last build succeeded; drop the stale transcript
 
           if code ~= 0 then
             config.log('info', 'Compile finished with warnings (exit=%d), PDF updated', code)
@@ -1311,11 +1427,20 @@ function M._compile_local()
             end
           end
 
-          -- Fallback: open okular with --unique so it reuses an existing window
-          vim.fn.jobstart({ 'okular', '--unique', pdf_path }, { detach = true })
+          -- Fallback: open okular only if not already running
+          local pgrep_output = vim.fn.system('pgrep okular')
+          if pgrep_output == '' or vim.v.shell_error ~= 0 then
+            vim.fn.jobstart({ 'okular', pdf_path }, { detach = true })
+          end
         end)
       end,
     })
+
+    if not job or job <= 0 then
+      config.log('error', 'Could not start latexmk — is it installed and on PATH?')
+      return
+    end
+    M._compile_job = job
   end
 
   attempt(false)
