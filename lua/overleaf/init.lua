@@ -46,10 +46,87 @@ M._compile_job = nil
 function M.setup(opts)
   config.setup(opts)
 
-  -- Set vimtex viewer defaults for okular + synctex if the user hasn't configured them.
-  -- Okular's --unique flag reuses an existing window and supports forward/inverse search.
-  -- For inverse search, configure okular's editor (Settings → Editor) to:
-  --   nvim --headless -c "VimtexInverseSearch %l '%f'"
+  -- Inverse search command for Okular: nvr -s /tmp/nvimsocket --remote-send ":e %f<CR>:%l<CR>"
+  vim.api.nvim_create_user_command('InverseSearch', function(opts)
+    local file = opts.fargs[1]
+    local line = tonumber(opts.fargs[2] or 1)
+    vim.cmd('edit ' .. vim.fn.fnameescape(file))
+    vim.api.nvim_win_set_cursor(0, { line, 0 })
+  end, { nargs = '+' })
+
+  -- Attach change detection when a file in sync dir is opened via inverse search
+  vim.api.nvim_create_autocmd('BufReadPost', {
+    callback = function(event)
+      local bufnr = event.buf
+      local file_path = vim.fs.normalize(vim.api.nvim_buf_get_name(bufnr))
+      local sync_mod = require('overleaf.sync')
+      local sync_dir = sync_mod._sync_dir
+
+      config.log('debug', 'BufReadPost: file=%s, sync_dir=%s', file_path, sync_dir or 'nil')
+
+      if not sync_dir then return end
+      sync_dir = vim.fs.normalize(sync_dir)
+
+      if file_path:sub(1, #sync_dir) == sync_dir then
+        local rel_path = file_path:sub(#sync_dir + 2)
+        config.log('debug', 'rel_path=%s, searching docs...', rel_path)
+
+        -- Log all available documents
+        local doc_count = 0
+        for _, doc in pairs(M._state.documents) do
+          doc_count = doc_count + 1
+          config.log('debug', 'available doc[%d]: path=%s', doc_count, doc.path or 'nil')
+        end
+
+        -- Attach compile-on-write if not already there
+        local existing = vim.api.nvim_get_autocmds({ event = 'BufWriteCmd', buffer = bufnr })
+        if #existing == 0 then
+          vim.api.nvim_create_autocmd('BufWriteCmd', {
+            buffer = bufnr,
+            callback = function()
+              vim.bo[bufnr].modified = false
+              M.compile()
+            end,
+          })
+        end
+
+        local found_doc = nil
+        for _, doc in pairs(M._state.documents) do
+          config.log('debug', 'comparing doc.path=%s (lower=%s) with rel_path=%s (lower=%s)',
+            doc.path or 'nil', (doc.path and doc.path:lower()) or 'nil', rel_path, rel_path:lower())
+          if doc.path and doc.path:lower() == rel_path:lower() then
+            found_doc = doc
+            break
+          end
+        end
+
+        if found_doc then
+          config.log('debug', 'found matching doc with id=%s, joined=%s, content_len=%d',
+            found_doc.doc_id, tostring(found_doc.joined), #(found_doc.content or ''))
+          local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+          local buf_content = table.concat(lines, '\n')
+
+          -- If document has no content yet (pre-loaded but not joined), use buffer content
+          if not found_doc.content or found_doc.content == '' then
+            config.log('debug', 'document has no content, using buffer content (len=%d)', #buf_content)
+            found_doc.content = buf_content
+            found_doc.server_content = buf_content
+            found_doc.version = 0
+            found_doc.joined = true  -- Mark as joined so change detection works
+          else
+            config.log('debug', 'document has content, syncing buffer')
+            found_doc.content = buf_content
+          end
+
+          found_doc.bufnr = bufnr
+          config.log('debug', 'calling attach on bufnr=%d, joined=%s', bufnr, tostring(found_doc.joined))
+          require('overleaf.buffer').attach(bufnr, found_doc)
+          return
+        end
+        config.log('debug', 'no matching document found for %s', rel_path)
+      end
+    end,
+  })
   vim.schedule(function()
     if vim.fn.executable('okular') == 1 then
       if not vim.g.vimtex_view_method then
@@ -61,6 +138,8 @@ function M.setup(opts)
       end
     end
   end)
+
+
 
   -- Default keymaps (prefix: <leader>o for Overleaf)
   local keys = opts and opts.keys or true
@@ -210,6 +289,24 @@ function M._connect_project(cookie, project_id, project_name)
     -- Start file sync (if sync_dir configured)
     sync.start(project_name)
     sync.sync_all(M._state, project._project_tree)
+
+    -- Pre-load all documents so inverse search works for all files
+    vim.schedule(function()
+      config.log('info', 'Pre-loading documents for inverse search...')
+      local project_mod = require('overleaf.project')
+      local doc_module = require('overleaf.document')
+      local buf_module = require('overleaf.buffer')
+      local loaded = 0
+
+      for _, entry in ipairs(project_mod._project_tree) do
+        if entry.type == 'doc' then
+          local doc = doc_module.new(entry.id, entry.path)
+          M._state.documents[entry.id] = doc
+          loaded = loaded + 1
+        end
+      end
+      config.log('info', 'Pre-loaded %d documents', loaded)
+    end)
 
     -- Show tree immediately
     vim.schedule(function() require('overleaf.tree').toggle() end)
@@ -1443,7 +1540,7 @@ function M._compile_local()
     M._compile_job = job
   end
 
-  attempt(false)
+  attempt(true)
 end
 
 --- Take the last `n` non-empty lines of a list of strings, joined by '\n'.
