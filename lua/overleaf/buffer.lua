@@ -5,25 +5,38 @@ local M = {}
 
 local undo_ns = vim.api.nvim_create_namespace('overleaf_undo')
 
--- (Re)create the extmark tracking `text` that currently sits at (sr, sc).
+-- Single-point extmark at the region start. Right gravity for non-empty text,
+-- so text typed at the start boundary pushes the point right instead of into the region.
 local function set_mark(bufnr, id, sr, sc, text)
-  local lines = vim.split(text, '\n', { plain = true })
-  local opts = { id = id }
-  if text == '' then
-    opts.right_gravity = false
-  else
-    opts.end_row = sr + #lines - 1
-    opts.end_col = (#lines == 1) and (sc + #lines[1]) or #lines[#lines]
-    opts.right_gravity, opts.end_right_gravity = true, false
-  end
-  return vim.api.nvim_buf_set_extmark(bufnr, undo_ns, sr, sc, opts)
+  return vim.api.nvim_buf_set_extmark(bufnr, undo_ns, sr, sc, {
+    id = id,
+    right_gravity = text ~= '',
+  })
 end
 
-local function mark_span(bufnr, id)
-  local m = vim.api.nvim_buf_get_extmark_by_id(bufnr, undo_ns, id, { details = true })
+-- Where a region of `text` starting at (sr, sc) ends.
+local function span_end(sr, sc, text)
+  local lines = vim.split(text, '\n', { plain = true })
+  if #lines == 1 then return sr, sc + #lines[1] end
+  return sr + #lines - 1, #lines[#lines]
+end
+
+local function mark_span(bufnr, id, text)
+  local m = vim.api.nvim_buf_get_extmark_by_id(bufnr, undo_ns, id, {})
   if #m == 0 then return end
-  local d = m[3] or {}
-  return m[1], m[2], d.end_row or m[1], d.end_col or m[2]
+  local er, ec = span_end(m[1], m[2], text)
+  return m[1], m[2], er, ec
+end
+
+-- Region currently occupied by an undo entry's text.
+-- No remote edit since it was recorded: the recorded position is exact (undo is LIFO).
+-- Otherwise fall back to the extmark, which follows collaborator edits.
+local function entry_span(doc, e)
+  if e.row and (e.epoch or 0) == (doc._remote_epoch or 0) then
+    local er, ec = span_end(e.row, e.col, e.cur)
+    return e.row, e.col, er, ec
+  end
+  return mark_span(doc.bufnr, e.mark, e.cur)
 end
 
 --- Record one local change (called from _sync).
@@ -39,49 +52,93 @@ function M._undo_record(doc, old, new, ops)
   end
   local sr, sc = ot.byte_offset_to_pos(new, ot.char_to_byte(old, ops[1].p))
 
-  for _, e in ipairs(u.redo) do pcall(vim.api.nvim_buf_del_extmark, bufnr, undo_ns, e.mark) end
+  for _, e in ipairs(u.redo) do
+    pcall(vim.api.nvim_buf_del_extmark, bufnr, undo_ns, e.mark)
+  end
   u.redo = {}
 
-  -- Coalesce consecutive typing / backspacing into one undo step
+  -- Coalesce consecutive typing / insert-mode deletion into one undo step
   local prev = u.undo[#u.undo]
-  local fresh = prev and not doc._undo_seal and (vim.uv.now() - prev.t) < 1000
+  local fresh = prev
+    and prev.row
+    and not doc._undo_seal
+    and (prev.epoch or 0) == (doc._remote_epoch or 0)
+    and (vim.uv.now() - prev.t) < 1000
   doc._undo_seal = false
   if fresh then
-    local psr, psc, per, pec = mark_span(bufnr, prev.mark)
-    if psr then
-      if del == '' and prev.orig == '' and sr == per and sc == pec then
-        prev.cur = prev.cur .. ins
-        set_mark(bufnr, prev.mark, psr, psc, prev.cur)
+    local per, pec = span_end(prev.row, prev.col, prev.cur)
+    local in_insert = vim.fn.mode():sub(1, 1) == 'i'
+
+    if del == '' and prev.orig == '' and sr == per and sc == pec then
+      -- typing right after the previous insertion
+      prev.cur = prev.cur .. ins
+      prev.t = vim.uv.now()
+      return
+    elseif ins == '' and prev.cur == '' and in_insert then
+      local der, dec = span_end(sr, sc, del)
+      if sr == prev.row and sc == prev.col then
+        -- forward delete (<Del>): deletes the text after the previous deletion
+        prev.orig = prev.orig .. del
         prev.t = vim.uv.now()
         return
-      elseif ins == '' and prev.cur == '' and sr == psr and sc == psc
-          and vim.fn.mode():sub(1, 1) == 'i' then
+      elseif der == prev.row and dec == prev.col then
+        -- backspace: deletes the text before the previous deletion
         prev.orig = del .. prev.orig
+        prev.row, prev.col = sr, sc
+        set_mark(bufnr, prev.mark, sr, sc, '')
         prev.t = vim.uv.now()
         return
       end
     end
   end
 
-  -- cur = text currently in the buffer at the mark, orig = what it replaced
-  table.insert(u.undo, { mark = set_mark(bufnr, nil, sr, sc, ins), cur = ins, orig = del, t = vim.uv.now() })
+  -- cur = text currently in the buffer at the region, orig = what it replaced
+  table.insert(u.undo, {
+    mark = set_mark(bufnr, nil, sr, sc, ins),
+    cur = ins,
+    orig = del,
+    t = vim.uv.now(),
+    row = sr,
+    col = sc,
+    epoch = doc._remote_epoch or 0,
+  })
 end
 
--- Swap the tracked region's text for `orig`; returns the reversed entry.
+-- Swap the tracked region's text for `orig`; returns the reversed entry,
+-- or nil if the step is no longer valid.
 local function flip(doc, e)
   local bufnr = doc.bufnr
-  local sr, sc, er, ec = mark_span(bufnr, e.mark)
-  if not sr then return end
-  local cur = table.concat(vim.api.nvim_buf_get_text(bufnr, sr, sc, er, ec, {}), '\n')
-  if cur ~= e.cur then return end -- a collaborator touched this text
+  local function drop() pcall(vim.api.nvim_buf_del_extmark, bufnr, undo_ns, e.mark) end
 
-  vim.api.nvim_buf_del_extmark(bufnr, undo_ns, e.mark)
+  local sr, sc, er, ec = entry_span(doc, e)
+  if not sr then
+    drop()
+    return
+  end
+
+  local ok, text = pcall(vim.api.nvim_buf_get_text, bufnr, sr, sc, er, ec, {})
+  if not ok or table.concat(text, '\n') ~= e.cur then -- text was changed by someone else
+    drop()
+    return
+  end
+
+  drop()
   doc._undo_busy = true
-  vim.api.nvim_buf_set_text(bufnr, sr, sc, er, ec, vim.split(e.orig, '\n', { plain = true }))
-  pcall(M._sync, doc, bufnr) -- submit the op now, without recording a new entry
+  local set_ok = pcall(vim.api.nvim_buf_set_text, bufnr, sr, sc, er, ec, vim.split(e.orig, '\n', { plain = true }))
+  if set_ok then pcall(M._sync, doc, bufnr) end -- submit the op now, without recording a new entry
   doc._undo_busy = false
+  if not set_ok then return end
+
   pcall(vim.api.nvim_win_set_cursor, 0, { sr + 1, sc })
-  return { mark = set_mark(bufnr, nil, sr, sc, e.orig), cur = e.orig, orig = e.cur, t = 0 }
+  return {
+    mark = set_mark(bufnr, nil, sr, sc, e.orig),
+    cur = e.orig,
+    orig = e.cur,
+    t = 0,
+    row = sr,
+    col = sc,
+    epoch = doc._remote_epoch or 0,
+  }
 end
 
 function M.undo_redo(doc, redo)
@@ -290,7 +347,11 @@ end
 function M.attach(bufnr, doc)
   vim.api.nvim_buf_attach(bufnr, false, {
     on_bytes = function(_, buf)
-      if doc.applying_remote then return end
+      if doc.applying_remote then
+        -- Any remote/full-buffer replacement invalidates recorded undo positions
+        doc._remote_epoch = (doc._remote_epoch or 0) + 1
+        return
+      end
       if not doc.joined then return end
       if doc._sync_scheduled then return end
       doc._sync_scheduled = true
