@@ -146,14 +146,15 @@ function M.transform_component(c1, c2, side)
         -- Insert is before our delete
         return { { p = c1.p + c2_i_len, d = c1.d } }
       else
-        -- Insert splits our delete: need to split d by character offset
+        -- Insert splits our delete. Components apply sequentially, so after
+        -- the first half is deleted the second half starts at c1.p + c2_i_len.
         local split_chars = c2.p - c1.p
         local split_byte = M.char_to_byte(c1.d, split_chars)
         local before = c1.d:sub(1, split_byte)
         local after = c1.d:sub(split_byte + 1)
         return {
           { p = c1.p, d = before },
-          { p = c1.p + M.utf8_len(before) + c2_i_len, d = after },
+          { p = c1.p + c2_i_len, d = after },
         }
       end
     elseif c2.d then
@@ -198,30 +199,59 @@ function M.transform_component(c1, c2, side)
   return { c1 }
 end
 
+local function copy(t)
+  local r = {}
+  for i, v in ipairs(t) do
+    r[i] = v
+  end
+  return r
+end
+
+--- Transform two ops (lists of components) against each other.
+--- `left` wins ties. Returns left', right' such that
+--- apply(apply(base, left), right') == apply(apply(base, right), left')
+---@param left table[]
+---@param right table[]
+---@return table[] left_prime
+---@return table[] right_prime
+function M.transform_x(left, right)
+  if #left == 0 or #right == 0 then return copy(left), copy(right) end
+
+  if #left == 1 and #right == 1 then
+    return M.transform_component(left[1], right[1], 'left'),
+      M.transform_component(right[1], left[1], 'right')
+  end
+
+  if #left > 1 then
+    local l1p, rp = M.transform_x({ left[1] }, right)
+    local restp, rpp = M.transform_x(vim.list_slice(left, 2), rp)
+    for _, c in ipairs(restp) do
+      table.insert(l1p, c)
+    end
+    return l1p, rpp
+  end
+
+  -- one left component, several right components
+  local lp, r1p = M.transform_x(left, { right[1] })
+  local lpp, restp = M.transform_x(lp, vim.list_slice(right, 2))
+  for _, c in ipairs(restp) do
+    table.insert(r1p, c)
+  end
+  return lpp, r1p
+end
+
 --- Transform a list of ops against another list of ops
 ---@param ops1 table[] ops to transform
 ---@param ops2 table[] ops to transform against
----@param side string 'left' or 'right'
+---@param side string 'left' (ops1 wins ties) or 'right' (ops2 wins ties)
 ---@return table[] transformed ops1
 function M.transform_ops(ops1, ops2, side)
-  local result = {}
-  for _, c1 in ipairs(ops1) do
-    local current = { c1 }
-    for _, c2 in ipairs(ops2) do
-      local next_current = {}
-      for _, c in ipairs(current) do
-        local transformed = M.transform_component(c, c2, side)
-        for _, t in ipairs(transformed) do
-          table.insert(next_current, t)
-        end
-      end
-      current = next_current
-    end
-    for _, c in ipairs(current) do
-      table.insert(result, c)
-    end
+  if side == 'left' then
+    local l = M.transform_x(ops1, ops2)
+    return l
   end
-  return result
+  local _, r = M.transform_x(ops2, ops1)
+  return r
 end
 
 --- Compose two operations into one (op2 applied after op1)

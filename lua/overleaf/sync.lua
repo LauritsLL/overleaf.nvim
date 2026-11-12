@@ -337,6 +337,7 @@ end
 ---@param callback function|nil called when done
 function M.sync_all(state, project_tree, callback)
   if not M._sync_dir then
+    config.log('warn', 'sync_all: no sync directory set, nothing written')
     if callback then callback() end
     return
   end
@@ -364,69 +365,110 @@ function M.sync_all(state, project_tree, callback)
   end
 
   -- Sync text documents
-  if #docs == 0 then
+  local total = #docs
+  if total == 0 then
     if callback then callback() end
     return
   end
 
-  config.log('info', 'Syncing %d document(s) to disk...', #docs)
+  config.log('info', 'Syncing %d document(s) to disk...', total)
 
-  local remaining = #docs
-  local function on_done()
-    remaining = remaining - 1
-    if remaining <= 0 then
-      config.log('info', 'Sync complete: %s', M._sync_dir)
+  local MAX_CONCURRENT = 3
+  local MAX_TRIES = 3
+  local next_i = 1
+  local active = 0
+  local finished = 0
+  local failed = {}
+  local pump
+
+  local function finish(job, err)
+    active = active - 1
+    finished = finished + 1
+    if err then table.insert(failed, job.entry.path) end
+
+    if finished >= total then
+      if #failed > 0 then
+        config.log(
+          'warn',
+          'Sync: %d of %d document(s) could not be downloaded: %s',
+          #failed,
+          total,
+          table.concat(failed, ', ')
+        )
+      else
+        config.log('info', 'Sync complete: %s', M._sync_dir)
+      end
       if callback then callback() end
+    else
+      pump()
     end
   end
 
-  for _, entry in ipairs(docs) do
-    local doc_id = entry.id
-    local doc_path = entry.path
+  local function process(job)
+    local doc_id = job.entry.id
+    local doc_path = job.entry.path
 
-    -- Check if already open
+    -- Already joined/open: just write
     local existing = state.documents[doc_id]
     if existing and existing.content then
-      -- Already joined, just write
       M.write_doc(existing)
       M.watch(existing)
-      on_done()
-    else
-      -- Need to join, write, leave
-      bridge.request('joinDoc', { docId = doc_id }, function(err, result)
-        if err then
-          config.log('debug', 'Sync skip %s: %s', doc_path, err.message)
-          on_done()
-          return
-        end
+      finish(job)
+      return
+    end
 
-        local content = table.concat(result.lines, '\n')
-
-        -- Create a lightweight doc object for writing and watching
-        local doc = state.documents[doc_id]
-        if not doc then
-          local Document = require('overleaf.document')
-          doc = Document.new(doc_id, doc_path)
-          doc.content = content
-          doc.server_content = content
-          doc.version = result.version
-          -- Store it so watchers can find it
-          state.documents[doc_id] = doc
-        end
-
-        M.write_doc(doc)
-        M.watch(doc)
-
-        -- Leave if no buffer (not opened by user)
-        if not doc.bufnr then
-          doc.joined = false
-          bridge.request('leaveDoc', { docId = doc_id }, function() on_done() end)
+    -- Need to join, write, leave
+    bridge.request('joinDoc', { docId = doc_id }, function(err, result)
+      if err then
+        job.tries = job.tries + 1
+        if job.tries < MAX_TRIES then
+          config.log('debug', 'Sync retry %s (%d): %s', doc_path, job.tries, tostring(err.message))
+          vim.defer_fn(function() process(job) end, 500 * job.tries)
         else
-          on_done()
+          config.log('warn', 'Sync failed for %s: %s', doc_path, tostring(err.message or vim.inspect(err)))
+          finish(job, err)
         end
-      end)
+        return
+      end
+
+      local content = table.concat(result.lines, '\n')
+
+      -- Create or complete a lightweight doc object for writing and watching
+      local doc = state.documents[doc_id]
+      if not doc then
+        local Document = require('overleaf.document')
+        doc = Document.new(doc_id, doc_path)
+        state.documents[doc_id] = doc
+      end
+      if not doc.content then
+        doc.content = content
+        doc.server_content = content
+        doc.version = result.version
+      end
+
+      M.write_doc(doc)
+      M.watch(doc)
+
+      -- Leave if no buffer (not opened by user)
+      if not doc.bufnr then
+        doc.joined = false
+        bridge.request('leaveDoc', { docId = doc_id }, function() finish(job) end)
+      else
+        finish(job)
+      end
+    end)
+  end
+
+  pump = function()
+    while active < MAX_CONCURRENT and next_i <= total do
+      local job = { entry = docs[next_i], tries = 0 }
+      next_i = next_i + 1
+      active = active + 1
+      process(job)
     end
   end
+
+  pump()
 end
 
 --- Re-sync: read all disk files and push changes to Overleaf

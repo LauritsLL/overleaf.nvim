@@ -3,6 +3,120 @@ local config = require('overleaf.config')
 
 local M = {}
 
+local undo_ns = vim.api.nvim_create_namespace('overleaf_undo')
+
+-- (Re)create the extmark tracking `text` that currently sits at (sr, sc).
+local function set_mark(bufnr, id, sr, sc, text)
+  local lines = vim.split(text, '\n', { plain = true })
+  local opts = { id = id }
+  if text == '' then
+    opts.right_gravity = false
+  else
+    opts.end_row = sr + #lines - 1
+    opts.end_col = (#lines == 1) and (sc + #lines[1]) or #lines[#lines]
+    opts.right_gravity, opts.end_right_gravity = true, false
+  end
+  return vim.api.nvim_buf_set_extmark(bufnr, undo_ns, sr, sc, opts)
+end
+
+local function mark_span(bufnr, id)
+  local m = vim.api.nvim_buf_get_extmark_by_id(bufnr, undo_ns, id, { details = true })
+  if #m == 0 then return end
+  local d = m[3] or {}
+  return m[1], m[2], d.end_row or m[1], d.end_col or m[2]
+end
+
+--- Record one local change (called from _sync).
+function M._undo_record(doc, old, new, ops)
+  local bufnr = doc.bufnr
+  local u = doc.undo_state or { undo = {}, redo = {} }
+  doc.undo_state = u
+
+  local del, ins = '', ''
+  for _, op in ipairs(ops) do
+    if op.d then del = op.d end
+    if op.i then ins = op.i end
+  end
+  local sr, sc = ot.byte_offset_to_pos(new, ot.char_to_byte(old, ops[1].p))
+
+  for _, e in ipairs(u.redo) do pcall(vim.api.nvim_buf_del_extmark, bufnr, undo_ns, e.mark) end
+  u.redo = {}
+
+  -- Coalesce consecutive typing / backspacing into one undo step
+  local prev = u.undo[#u.undo]
+  local fresh = prev and not doc._undo_seal and (vim.uv.now() - prev.t) < 1000
+  doc._undo_seal = false
+  if fresh then
+    local psr, psc, per, pec = mark_span(bufnr, prev.mark)
+    if psr then
+      if del == '' and prev.orig == '' and sr == per and sc == pec then
+        prev.cur = prev.cur .. ins
+        set_mark(bufnr, prev.mark, psr, psc, prev.cur)
+        prev.t = vim.uv.now()
+        return
+      elseif ins == '' and prev.cur == '' and sr == psr and sc == psc
+          and vim.fn.mode():sub(1, 1) == 'i' then
+        prev.orig = del .. prev.orig
+        prev.t = vim.uv.now()
+        return
+      end
+    end
+  end
+
+  -- cur = text currently in the buffer at the mark, orig = what it replaced
+  table.insert(u.undo, { mark = set_mark(bufnr, nil, sr, sc, ins), cur = ins, orig = del, t = vim.uv.now() })
+end
+
+-- Swap the tracked region's text for `orig`; returns the reversed entry.
+local function flip(doc, e)
+  local bufnr = doc.bufnr
+  local sr, sc, er, ec = mark_span(bufnr, e.mark)
+  if not sr then return end
+  local cur = table.concat(vim.api.nvim_buf_get_text(bufnr, sr, sc, er, ec, {}), '\n')
+  if cur ~= e.cur then return end -- a collaborator touched this text
+
+  vim.api.nvim_buf_del_extmark(bufnr, undo_ns, e.mark)
+  doc._undo_busy = true
+  vim.api.nvim_buf_set_text(bufnr, sr, sc, er, ec, vim.split(e.orig, '\n', { plain = true }))
+  pcall(M._sync, doc, bufnr) -- submit the op now, without recording a new entry
+  doc._undo_busy = false
+  pcall(vim.api.nvim_win_set_cursor, 0, { sr + 1, sc })
+  return { mark = set_mark(bufnr, nil, sr, sc, e.orig), cur = e.orig, orig = e.cur, t = 0 }
+end
+
+function M.undo_redo(doc, redo)
+  if not doc.bufnr or not vim.api.nvim_buf_is_valid(doc.bufnr) then return end
+  M._sync(doc, doc.bufnr) -- flush pending local edits into the stack first
+  doc._undo_seal = true
+  local u = doc.undo_state
+  if not u then return end
+  local from, to = u.undo, u.redo
+  if redo then from, to = u.redo, u.undo end
+  while #from > 0 do
+    local flipped = flip(doc, table.remove(from))
+    if flipped then table.insert(to, flipped) return end
+    vim.notify('[overleaf] skipped a step: a collaborator edited that text', vim.log.levels.INFO)
+  end
+  vim.notify(redo and 'Already at newest change' or 'Already at oldest change')
+end
+
+function M.setup_undo(bufnr, doc)
+  vim.bo[bufnr].undolevels = -1 -- Vim's own undo would also revert collaborators
+  vim.bo[bufnr].undofile = false
+  local function map(lhs, redo)
+    vim.keymap.set('n', lhs, function()
+      local n = vim.v.count1
+      for _ = 1, n do M.undo_redo(doc, redo) end
+    end, { buffer = bufnr, desc = redo and 'Overleaf redo' or 'Overleaf undo' })
+  end
+  map('u', false)
+  map('<C-r>', true)
+  vim.api.nvim_create_autocmd('InsertLeave', {
+    buffer = bufnr,
+    callback = function() doc._undo_seal = true end,
+  })
+end
+
 --- Create a Neovim buffer for an Overleaf document
 ---@param doc table Document instance
 ---@param lines string[] document lines
@@ -20,8 +134,6 @@ function M.create(doc, lines)
   vim.bo[bufnr].modified = false
 
   -- Clear undo history so 'u' doesn't wipe the buffer after initial load.
-  -- Uses API calls instead of 'exe "normal a \<BS>\<Esc>"' to avoid
-  -- literal garbage insertion when special keys aren't interpreted (Issue #5).
   local old_undolevels = vim.bo[bufnr].undolevels
   vim.bo[bufnr].undolevels = -1
   vim.api.nvim_buf_set_text(bufnr, 0, 0, 0, 0, { ' ' })
@@ -43,8 +155,10 @@ function M.create(doc, lines)
   -- Attach change detection
   M.attach(bufnr, doc)
 
+  -- Collaborator-safe undo (turns off Vim's own undo for this buffer)
+  M.setup_undo(bufnr, doc)
+
   -- Verify buffer matches doc.content after undo-clear
-  -- (guards against Issue #5: exe 'normal a \<BS>\<Esc>' inserting garbage)
   doc:check_content()
 
   -- Open buffer in current window FIRST (so FileType autocmds fire on current buffer)
@@ -69,8 +183,6 @@ function M.create(doc, lines)
   }
 
   -- Tell VimTeX which file is the project root BEFORE the FileType event fires.
-  -- VimTeX reads b:vimtex_main during its initialisation; setting it here ensures
-  -- multi-file Overleaf projects compile from the correct entry point.
   if ft_map[ext] == 'tex' then
     local sync_mod = require('overleaf.sync')
     if sync_mod._sync_dir then
@@ -89,7 +201,6 @@ function M.create(doc, lines)
   -- Start syntax highlighting and LSP
   config.log('debug', 'Buffer create: ext=%s ft=%s', tostring(ext), tostring(ft_map[ext]))
   if ft_map[ext] then
-    -- treesitter language name differs from filetype (tex -> latex)
     local ts_lang_map = { tex = 'latex', bib = 'bibtex' }
     local lang = ts_lang_map[ft_map[ext]] or ft_map[ext]
     vim.schedule(function()
@@ -98,14 +209,11 @@ function M.create(doc, lines)
       local ok = pcall(vim.treesitter.start, bufnr, lang)
       if not ok then pcall(vim.cmd, 'syntax enable') end
 
-      -- Attach LSP servers to overleaf buffer (lspconfig skips overleaf:// URIs)
       config.log('info', 'Attaching LSP for ft=%s bufnr=%d', ft_map[ext], bufnr)
       M._attach_lsp(bufnr, ft_map[ext])
 
-      -- Run chktex linter for tex files
       if ft_map[ext] == 'tex' then
         M._run_chktex(bufnr)
-        -- Re-lint on text changes (debounced)
         vim.api.nvim_create_autocmd({ 'TextChanged', 'TextChangedI' }, {
           buffer = bufnr,
           callback = function() M._schedule_lint(bufnr) end,
@@ -206,10 +314,14 @@ function M._sync(doc, bufnr)
 
   if buf_content == doc.content then return end
 
-  local ops = M._diff_ops(doc.content or '', buf_content)
+  local old = doc.content or ''
+  local ops = M._diff_ops(old, buf_content)
   doc.content = buf_content
 
-  if #ops > 0 then doc:submit_op(ops) end
+  if #ops > 0 then
+    if not doc._undo_busy then M._undo_record(doc, old, buf_content, ops) end
+    doc:submit_op(ops)
+  end
   require('overleaf.sync').schedule_write(doc)
 end
 
@@ -278,6 +390,7 @@ function M.apply_remote(doc, ops)
   if not doc.bufnr or not vim.api.nvim_buf_is_valid(doc.bufnr) then return end
 
   doc.applying_remote = true
+  doc._undo_seal = true -- typing after a collaborator's edit starts a new undo step
 
   local had_error = false
 

@@ -5,6 +5,31 @@ local config = require('overleaf.config')
 local Document = {}
 Document.__index = Document
 
+-- Re-apply the local change (base -> mine) onto `theirs`. Returns nil if unsafe.
+local function merge_local(base, mine, theirs)
+  local bl, ml = #base, #mine
+  local pre, minl = 0, math.min(bl, ml)
+  while pre < minl and base:byte(pre + 1) == mine:byte(pre + 1) do
+    pre = pre + 1
+  end
+  local suf, maxs = 0, minl - pre
+  while suf < maxs and base:byte(bl - suf) == mine:byte(ml - suf) do
+    suf = suf + 1
+  end
+
+  local del = base:sub(pre + 1, bl - suf)
+  local ins = mine:sub(pre + 1, ml - suf)
+  local before = base:sub(math.max(1, pre - 19), pre)
+  local after = base:sub(bl - suf + 1, bl - suf + 20)
+  local ctx = before .. del .. after
+  if ctx == '' then return nil end
+
+  local s = theirs:find(ctx, 1, true)
+  if not s or theirs:find(ctx, s + 1, true) then return nil end -- missing or ambiguous
+  local start = s - 1 + #before
+  return theirs:sub(1, start) .. ins .. theirs:sub(start + #del + 1)
+end
+
 function Document.new(doc_id, path)
   local self = setmetatable({}, Document)
   self.doc_id = doc_id
@@ -155,6 +180,7 @@ function Document:rejoin(attempt)
       end
 
       self._rejoining = false
+      local base = self.server_content or ''
       local content = table.concat(result.lines, '\n')
       self.version = result.version
       self.content = content
@@ -165,11 +191,44 @@ function Document:rejoin(attempt)
       config.log('info', 'Rejoined doc %s (v%d)', self.path, self.version)
 
       if self.bufnr and vim.api.nvim_buf_is_valid(self.bufnr) then
+        self.applying_remote = true -- blocks _sync until we've merged
         vim.schedule(function()
-          self.applying_remote = true
-          vim.api.nvim_buf_set_lines(self.bufnr, 0, -1, false, result.lines)
-          vim.bo[self.bufnr].modified = false
+          local bufnr = self.bufnr
+          if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+            self.applying_remote = false
+            return
+          end
+
+          local mine = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
+          local final_lines, resubmit = result.lines, false
+
+          if mine ~= content and mine ~= base then
+            local merged = merge_local(base, mine, content)
+            if merged then
+              final_lines = vim.split(merged, '\n', { plain = true })
+              resubmit = true
+            else
+              local dir = vim.fn.stdpath('state') .. '/overleaf-conflicts'
+              vim.fn.mkdir(dir, 'p')
+              local name = (self.path:gsub('[/\\]', '_'))
+              local f = ('%s/%s.%s.bak'):format(dir, name, os.date('%Y%m%d-%H%M%S'))
+              vim.fn.writefile(vim.split(mine, '\n', { plain = true }), f)
+              vim.notify(
+                '[overleaf] rejoin replaced unsynced edits in ' .. self.path .. '; your text is saved at ' .. f,
+                vim.log.levels.WARN
+              )
+            end
+          end
+
+          vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, final_lines)
+          vim.bo[bufnr].modified = false
           self.applying_remote = false
+
+          if resubmit then
+            self._undo_busy = true
+            pcall(require('overleaf.buffer')._sync, self, bufnr)
+            self._undo_busy = false
+          end
         end)
       end
     end)
@@ -203,9 +262,21 @@ end
 function Document:on_remote_op(update, apply_to_buffer)
   if not self.joined then return end
 
+  -- Fold any not-yet-diffed local edit into doc.content/pending_ops first,
+  -- so the remote op is transformed against what is really in the buffer.
+  self:check_content()
+
   -- Version check — on mismatch, rejoin to resync
   if update.v ~= self.version then
-    config.log('debug', 'Version mismatch: expected %d, got %d for %s', self.version, update.v, self.path)
+    config.log(
+      'warn',
+      'Version mismatch for %s: expected %d, got %d (inflight=%s pending=%s)',
+      self.path,
+      self.version,
+      update.v,
+      tostring(self.inflight_op ~= nil),
+      tostring(self.pending_ops ~= nil)
+    )
     if require('overleaf')._state.connected then self:rejoin() end
     return
   end
