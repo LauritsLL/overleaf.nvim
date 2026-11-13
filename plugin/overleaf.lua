@@ -82,3 +82,5 @@ end, {
     return {}
   end,
 })
+
+vim.api.nvim_create_user_command('OverleafLog', function() require('overleaf.config').show_log() end, {})

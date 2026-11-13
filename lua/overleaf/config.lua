@@ -11,6 +11,7 @@ M._config = {
   log_level = 'info', -- minimum level shown on screen: 'debug', 'info', 'warn', 'error'
   log_file_level = 'debug', -- minimum level written to the log file ('off' disables it)
   log_file = nil, -- nil = stdpath('state')/overleaf.log
+  popup_ms = 12000, -- how long long warn/error popups stay open (ms)
 }
 
 function M.setup(opts)
@@ -74,13 +75,88 @@ local VIM_LEVELS = {
   warn = vim.log.levels.WARN,
   error = vim.log.levels.ERROR,
 }
+local POPUP_HL = { warn = 'DiagnosticWarn', error = 'DiagnosticError' }
 
 --- Path of the log file (full, untruncated messages)
 function M.log_path() return M._config.log_file or (vim.fn.stdpath('state') .. '/overleaf.log') end
 
---- Log a message. Everything at or above `log_file_level` goes to the log file;
---- everything at or above `log_level` is shown on screen as ONE short line, so it
---- can never trigger the "Press ENTER" prompt.
+-- Floating popups for long warn/error messages, stacked top-right
+local popups = {}
+
+local function reflow()
+  local row = 1
+  for _, p in ipairs(popups) do
+    if vim.api.nvim_win_is_valid(p.win) then
+      pcall(vim.api.nvim_win_set_config, p.win, {
+        relative = 'editor',
+        row = row,
+        col = math.max(0, vim.o.columns - p.width - 2),
+      })
+      row = row + p.height + 2
+    end
+  end
+end
+
+local function close_popup(p)
+  if vim.api.nvim_win_is_valid(p.win) then pcall(vim.api.nvim_win_close, p.win, true) end
+  for i, q in ipairs(popups) do
+    if q == p then
+      table.remove(popups, i)
+      break
+    end
+  end
+  reflow()
+end
+
+local function show_popup(level, text)
+  local width = math.min(math.max(40, math.floor(vim.o.columns * 0.5)), math.max(20, vim.o.columns - 6))
+  local lines = vim.split(text, '\n', { plain = true })
+
+  local height = 0
+  for _, l in ipairs(lines) do
+    height = height + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / width))
+  end
+  height = math.max(1, math.min(height, math.floor(vim.o.lines * 0.6)))
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = 'wipe'
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+
+  local ok, win = pcall(vim.api.nvim_open_win, buf, false, {
+    relative = 'editor',
+    row = 1,
+    col = math.max(0, vim.o.columns - width - 2),
+    width = width,
+    height = height,
+    style = 'minimal',
+    border = 'rounded',
+    focusable = false,
+    noautocmd = true,
+    zindex = 250,
+    title = ' overleaf ' .. level .. ' ',
+    title_pos = 'left',
+  })
+  if not ok then
+    -- Could not open a float: fall back to a one-line notification
+    vim.notify('[overleaf] ' .. (text:gsub('%s*\n%s*', ' | ')), VIM_LEVELS[level])
+    return
+  end
+
+  vim.wo[win].wrap = true
+  vim.wo[win].linebreak = true
+  vim.wo[win].winhighlight = 'FloatBorder:' .. (POPUP_HL[level] or 'DiagnosticInfo') .. ',FloatTitle:' .. (POPUP_HL[level] or 'DiagnosticInfo')
+
+  local p = { win = win, width = width, height = height }
+  table.insert(popups, p)
+  reflow()
+  vim.defer_fn(function() close_popup(p) end, M._config.popup_ms or 12000)
+end
+
+--- Log a message. Everything at or above `log_file_level` goes to the log file
+--- (full text). On screen, nothing can trigger the "Press ENTER" prompt:
+---  * info/debug: one short truncated line
+---  * warn/error: the FULL text; a short message uses vim.notify, a long or
+---    multi-line one opens a self-closing popup
 function M.log(level, msg, ...)
   local target = LEVELS[level] or LEVELS.info
 
@@ -96,13 +172,29 @@ function M.log(level, msg, ...)
     end
   end
 
-  -- Screen: one line, truncated, deferred out of whatever command is running
+  -- Screen
   if target >= (LEVELS[M._config.log_level] or LEVELS.warn) then
-    local line = formatted:gsub('%s*\n%s*', ' | ')
+    local one_line = formatted:gsub('%s*\n%s*', ' | ')
     local max = math.max(20, vim.o.columns - 25)
-    if vim.fn.strchars(line) > max then line = vim.fn.strcharpart(line, 0, max - 1) .. '…' end
-    vim.schedule(function() vim.notify('[overleaf] ' .. line, VIM_LEVELS[level] or vim.log.levels.INFO) end)
+    local fits = formatted:find('\n', 1, true) == nil and vim.fn.strchars(formatted) <= max
+
+    vim.schedule(function()
+      if target >= LEVELS.warn then
+        if fits then
+          vim.notify('[overleaf] ' .. formatted, VIM_LEVELS[level])
+        else
+          show_popup(level, formatted)
+        end
+      else
+        local line = one_line
+        if vim.fn.strchars(line) > max then line = vim.fn.strcharpart(line, 0, max - 1) .. '…' end
+        vim.notify('[overleaf] ' .. line, VIM_LEVELS[level] or vim.log.levels.INFO)
+      end
+    end)
   end
 end
+
+--- Open the full log file in a split
+function M.show_log() vim.cmd('botright split ' .. vim.fn.fnameescape(M.log_path()) .. ' | normal! G') end
 
 return M
