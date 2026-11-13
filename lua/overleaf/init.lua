@@ -756,11 +756,29 @@ function M.preview_file()
   end)
 end
 
+--- The entry the user is "pointing at": the tree line under the cursor when the
+--- tree window is focused, otherwise the Overleaf file open in the current buffer.
+function M._context_entry()
+  local cur = vim.api.nvim_get_current_buf()
+  local tree = require('overleaf.tree')
+  if tree._bufnr and cur == tree._bufnr then
+    return project._project_tree[vim.api.nvim_win_get_cursor(0)[1]]
+  end
+  for _, doc in pairs(M._state.documents) do
+    if doc.bufnr == cur then
+      for _, e in ipairs(project._project_tree) do
+        if e.id == doc.doc_id then return e end
+      end
+    end
+  end
+end
+
 function M.create_doc(name, parent_folder_id)
   if not M._state.connected then
     config.log('warn', 'Not connected.')
     return
   end
+  if parent_folder_id == nil then parent_folder_id = project.parent_folder_id(M._context_entry()) end
 
   local prefix = project.get_folder_path(parent_folder_id)
 
@@ -826,6 +844,7 @@ function M.create_folder(name, parent_folder_id)
     config.log('warn', 'Not connected.')
     return
   end
+  if parent_folder_id == nil then parent_folder_id = project.parent_folder_id(M._context_entry()) end
 
   local prefix = project.get_folder_path(parent_folder_id)
 
@@ -903,47 +922,173 @@ function M.search(pattern)
   end
 end
 
-function M.upload_file(file_path, parent_folder_id)
+local function strip_slash(p)
+  local s = p:gsub('/+$', '')
+  return s
+end
+
+local function norm(p) return strip_slash(vim.fs.normalize(vim.fn.fnamemodify(p, ':p'))) end
+
+--- Overleaf folder id for a local directory. Returns id, kind where kind is
+--- 'root' | 'folder' | 'outside' (not in the sync dir) | 'missing' (in sync dir, not in project)
+function M._folder_for_dir(dir)
+  if not sync._sync_dir then return nil, 'outside' end
+  local root, d = norm(sync._sync_dir), norm(dir)
+  if d == root then return nil, 'root' end
+  if d:sub(1, #root + 1) ~= root .. '/' then return nil, 'outside' end
+  local rel = d:sub(#root + 2)
+  for _, e in ipairs(project._project_tree) do
+    if e.type == 'folder' and strip_slash(e.path) == rel then return e.id, 'folder' end
+  end
+  return nil, 'missing'
+end
+
+-- "a.png b.png", "Pictures/*.png", or one path containing spaces
+local function expand_upload_paths(spec)
+  local out, seen = {}, {}
+  local function add_pattern(pat)
+    for _, p in ipairs(vim.fn.glob(vim.fs.normalize(pat), false, true)) do
+      p = vim.fn.fnamemodify(p, ':p')
+      if vim.fn.filereadable(p) == 1 and not seen[p] then
+        seen[p] = true
+        table.insert(out, p)
+      end
+    end
+  end
+
+  spec = vim.trim(spec)
+  add_pattern(spec) -- whole string first: handles paths that contain spaces
+  if #out == 0 then
+    for part in spec:gmatch('%S+') do
+      add_pattern(part)
+    end
+  end
+  return out
+end
+
+local function upload_one(path, parent_id, cb)
+  local name = vim.fn.fnamemodify(path, ':t')
+  local full_path = project.get_folder_path(parent_id) .. name
+
+  if project.path_exists(full_path) and not config.get().upload_overwrite then
+    vim.schedule(function() cb('skipped') end)
+    return
+  end
+
+  bridge.request('uploadFile', {
+    cookie = config.get().cookie,
+    csrfToken = M._state.csrf_token,
+    projectId = M._state.project_id,
+    filePath = path,
+    fileName = name,
+    parentFolderId = parent_id,
+  }, function(err)
+    -- Tree update happens via the reciveNewFile socket event
+    if err then
+      cb('failed', err.message or vim.inspect(err))
+    else
+      cb('ok')
+    end
+  end)
+end
+
+--- Upload one or more local files (paths, globs, or one path with spaces).
+--- With no explicit parent, the Overleaf folder is chosen from the file's location
+--- in the sync dir; files outside the sync dir go to the project root.
+---@param spec string|nil
+---@param parent_folder_id string|nil
+function M.upload_files(spec, parent_folder_id)
   if not M._state.connected then
     config.log('warn', 'Not connected.')
     return
   end
 
-  local function do_upload(path)
-    if not path or path == '' then return end
-
-    -- Expand ~ and resolve
-    path = vim.fn.expand(path)
-    if vim.fn.filereadable(path) ~= 1 then
-      config.log('error', 'File not found: %s', path)
+  local function run(input)
+    local paths = expand_upload_paths(input)
+    if #paths == 0 then
+      config.log('warn', 'Upload: no readable file matched "%s"', input)
       return
     end
 
-    local file_name = vim.fn.fnamemodify(path, ':t')
-    config.log('info', 'Uploading %s...', file_name)
+    local MAX, idx, active, finished = 2, 1, 0, 0
+    local n_ok, skipped, failed = 0, {}, {}
+    local pump
 
-    bridge.request('uploadFile', {
-      cookie = config.get().cookie,
-      csrfToken = M._state.csrf_token,
-      projectId = M._state.project_id,
-      filePath = path,
-      fileName = file_name,
-      parentFolderId = parent_folder_id,
-    }, function(err, _result)
-      if err then
-        config.log('error', 'Upload failed: %s', err.message)
-        return
+    local function done(path, status, msg)
+      active = active - 1
+      finished = finished + 1
+      local name = vim.fn.fnamemodify(path, ':t')
+      if status == 'ok' then
+        n_ok = n_ok + 1
+      elseif status == 'skipped' then
+        table.insert(skipped, name)
+      else
+        table.insert(failed, name .. ' (' .. tostring(msg) .. ')')
       end
-      config.log('info', 'Uploaded: %s', file_name)
-      -- Tree update happens via reciveNewFile socket event
+
+      if finished == #paths then
+        config.log(
+          (#skipped + #failed > 0) and 'warn' or 'info',
+          'Upload: %d uploaded, %d skipped, %d failed%s%s',
+          n_ok,
+          #skipped,
+          #failed,
+          #skipped > 0 and (' | skipped (exists or folder missing): ' .. table.concat(skipped, ', ')) or '',
+          #failed > 0 and (' | failed: ' .. table.concat(failed, ', ')) or ''
+        )
+      else
+        pump()
+      end
+    end
+
+    pump = function()
+      while active < MAX and idx <= #paths do
+        local path = paths[idx]
+        idx = idx + 1
+        active = active + 1
+
+        local pid, kind = parent_folder_id, nil
+        if not pid then pid, kind = M._folder_for_dir(vim.fn.fnamemodify(path, ':h')) end
+
+        if kind == 'missing' then
+          vim.schedule(function() done(path, 'skipped') end)
+        else
+          upload_one(path, pid, function(status, msg) done(path, status, msg) end)
+        end
+      end
+    end
+
+    pump()
+  end
+
+  if spec and spec ~= '' then
+    run(spec)
+  else
+    vim.ui.input({ prompt = 'Local file path(s): ', completion = 'file' }, function(s)
+      if s and s ~= '' then run(s) end
     end)
   end
+end
 
-  if file_path then
-    do_upload(file_path)
-  else
-    vim.ui.input({ prompt = 'Local file path: ', completion = 'file' }, do_upload)
+-- Kept for the tree key and older callers
+function M.upload_file(file_path, parent_folder_id) M.upload_files(file_path, parent_folder_id) end
+
+--- Called by the sync dir watcher for a file that appeared locally
+function M._auto_upload(path)
+  if not M._state.connected or not sync._sync_dir then return end
+  local root = norm(sync._sync_dir)
+  local p = norm(path)
+  if p:sub(1, #root + 1) ~= root .. '/' then return end
+  local rel = p:sub(#root + 2)
+  if project.path_exists(rel) then return end -- already in the project
+
+  local allowed = config.get().auto_upload_ext
+  if allowed then
+    local ext = (rel:match('%.([^./]+)$') or ''):lower()
+    if not vim.tbl_contains(allowed, ext) then return end
   end
+
+  M.upload_files(path)
 end
 
 function M.rename_entity()
@@ -996,28 +1141,16 @@ function M.rename_entity()
   end)
 end
 
-function M.delete_entity()
+--- Delete an entry. With no argument: the entry under the tree cursor, else the file
+--- in the current buffer, else a picker.
+---@param entry table|nil
+function M.delete_entity(entry)
   if not M._state.connected then
     config.log('warn', 'Not connected.')
     return
   end
 
-  -- Show deletable entries
-  local entries = {}
-  for _, entry in ipairs(project._project_tree) do
-    table.insert(entries, entry)
-  end
-
-  vim.ui.select(entries, {
-    prompt = 'Delete:',
-    format_item = function(item)
-      local icon = item.type == 'folder' and '[dir] ' or ''
-      return icon .. item.path
-    end,
-  }, function(choice)
-    if not choice then return end
-
-    -- Confirm
+  local function confirm_and_delete(choice)
     vim.ui.input({ prompt = 'Delete "' .. choice.path .. '"? (y/N): ' }, function(answer)
       if answer ~= 'y' and answer ~= 'Y' then return end
 
@@ -1039,6 +1172,27 @@ function M.delete_entity()
         end)
       end)
     end)
+  end
+
+  entry = entry or M._context_entry()
+  if entry then
+    confirm_and_delete(entry)
+    return
+  end
+
+  if #project._project_tree == 0 then
+    config.log('warn', 'No project entries.')
+    return
+  end
+
+  vim.ui.select(project._project_tree, {
+    prompt = 'Delete:',
+    format_item = function(item)
+      local icon = item.type == 'folder' and '[dir] ' or ''
+      return icon .. item.path
+    end,
+  }, function(choice)
+    if choice then confirm_and_delete(choice) end
   end)
 end
 

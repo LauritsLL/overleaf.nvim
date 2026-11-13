@@ -154,20 +154,10 @@ function M._on_enter()
   -- No-op for folders
 end
 
---- Get the parent folder ID of the entry under cursor
+--- Get the target folder id for the entry under the cursor
 function M._get_parent_folder_id()
   local line_idx = vim.api.nvim_win_get_cursor(0)[1]
-  local tree = project._project_tree
-  if line_idx > #tree then return nil end
-  local entry = tree[line_idx]
-  if not entry then return nil end
-  if entry.type == 'folder' then return entry.id end
-  -- For files/docs, find parent folder by path
-  local parent_path = entry.path:match('^(.*/)') or ''
-  for _, e in ipairs(tree) do
-    if e.type == 'folder' and e.path == parent_path then return e.id end
-  end
-  return nil -- root folder
+  return project.parent_folder_id(project._project_tree[line_idx])
 end
 
 function M._create_doc()

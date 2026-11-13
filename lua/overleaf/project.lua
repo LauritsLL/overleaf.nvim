@@ -122,15 +122,51 @@ function M.path_exists(path)
   return false
 end
 
---- Add an entry to the tree (for after API create calls), dedup by ID
+local function strip_slash(p)
+  local s = p:gsub('/+$', '')
+  return s
+end
+
+--- Folder id that "new file here" should target for an entry:
+--- a folder -> itself, a file/doc -> its parent folder, root-level -> nil (root)
+function M.parent_folder_id(entry)
+  if not entry then return nil end
+  if entry.type == 'folder' then return entry.id end
+  local parent = strip_slash(entry.path):match('^(.*)/[^/]*$')
+  if not parent then return nil end
+  for _, e in ipairs(M._project_tree) do
+    if e.type == 'folder' and strip_slash(e.path) == parent then return e.id end
+  end
+  return nil
+end
+
+--- Add an entry to the flat tree, placed after the last entry of its parent folder
 function M.add_entry(entry)
   for _, existing in ipairs(M._project_tree) do
-    if existing.id == entry.id then
-      return false -- already exists
+    if existing.id == entry.id then return end
+  end
+
+  local pos = #M._project_tree + 1 -- root-level entries go at the end
+  local parent = strip_slash(entry.path):match('^(.*)/[^/]*$')
+
+  if parent then
+    local parent_idx
+    for i, e in ipairs(M._project_tree) do
+      if e.type == 'folder' and strip_slash(e.path) == parent then
+        parent_idx = i
+        break
+      end
+    end
+    if parent_idx then
+      pos = parent_idx + 1
+      local prefix = parent .. '/'
+      for i = parent_idx + 1, #M._project_tree do
+        if M._project_tree[i].path:sub(1, #prefix) == prefix then pos = i + 1 end
+      end
     end
   end
-  table.insert(M._project_tree, entry)
-  return true
+
+  table.insert(M._project_tree, pos, entry)
 end
 
 --- Rename an entry in the tree

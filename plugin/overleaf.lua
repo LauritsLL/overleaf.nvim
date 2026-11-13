@@ -12,7 +12,7 @@ local subcommands = {
   mkdir = function(args) require('overleaf').create_folder(args) end,
   delete = function() require('overleaf').delete_entity() end,
   rename = function() require('overleaf').rename_entity() end,
-  upload = function(args) require('overleaf').upload_file(args) end,
+  upload = function(_, rest) require('overleaf').upload_files(rest ~= '' and rest or nil) end,
   search = function(args) require('overleaf').search(args) end,
   main = function() require('overleaf').set_main() end,
   comments = function(args)
@@ -51,7 +51,8 @@ vim.api.nvim_create_user_command('Overleaf', function(opts)
 
   local handler = subcommands[sub]
   if handler then
-    handler(args[2])
+    local rest = vim.trim(opts.args:match('^%S+%s*(.*)$') or '')
+    handler(args[2], rest)
   else
     vim.notify(
       'Unknown subcommand: ' .. sub .. '\nAvailable: ' .. table.concat(vim.tbl_keys(subcommands), ', '),
@@ -77,6 +78,7 @@ end, {
     local sub = parts[2]
     if sub == 'comments' then return { 'refresh' } end
     if sub == 'sync' then return { 'import', 'export' } end
+    if sub == 'upload' then return vim.fn.getcompletion(arglead, 'file') end
     return {}
   end,
 })
