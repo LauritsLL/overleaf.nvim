@@ -197,6 +197,64 @@ function M.rename_entry(entity_id, new_name)
   return nil
 end
 
+--- Move an entry (and, for a folder, its children) under another parent folder.
+--- A parent id that is not a folder in the tree (nil or the project root) means root.
+--- Returns the entry and its old path, or nil if unknown or unchanged.
+function M.move_entry(entity_id, new_parent_id)
+  local target
+  for _, e in ipairs(M._project_tree) do
+    if e.id == entity_id then
+      target = e
+      break
+    end
+  end
+  if not target then return nil end
+
+  local parent_path, parent_depth = '', -1
+  if new_parent_id then
+    for _, e in ipairs(M._project_tree) do
+      if e.type == 'folder' and e.id == new_parent_id then
+        parent_path = strip_slash(e.path) .. '/'
+        parent_depth = e.depth or 0
+        break
+      end
+    end
+  end
+
+  local old_path = target.path
+  local new_path = parent_path .. target.name .. (target.type == 'folder' and '/' or '')
+  if new_path == old_path then return nil end
+  local delta = (parent_depth + 1) - (target.depth or 0)
+
+  -- Pull the moved block (entry + children) out of the list, keeping its order
+  local block, kept = {}, {}
+  for _, e in ipairs(M._project_tree) do
+    if e == target or (target.type == 'folder' and e.path:sub(1, #old_path) == old_path) then
+      table.insert(block, e)
+    else
+      table.insert(kept, e)
+    end
+  end
+
+  for i = #M._project_tree, 1, -1 do
+    M._project_tree[i] = nil
+  end
+  for _, e in ipairs(kept) do
+    table.insert(M._project_tree, e)
+  end
+
+  -- Rewrite paths and depths, then re-insert under the new parent
+  for _, e in ipairs(block) do
+    e.path = new_path .. e.path:sub(#old_path + 1)
+    e.depth = (e.depth or 0) + delta
+  end
+  for _, e in ipairs(block) do
+    M.add_entry(e) -- places each entry after the last child of its parent folder
+  end
+
+  return target, old_path
+end
+
 --- Update an entry's ID (used for file-restore where the doc gets a new _id)
 function M.update_entry_id(old_id, new_id)
   for _, entry in ipairs(M._project_tree) do

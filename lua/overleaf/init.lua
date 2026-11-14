@@ -491,6 +491,30 @@ function M._setup_event_handlers()
     end
   end
 
+  bridge.on_event('reciveEntityRename', function(data)
+    config.log('debug', 'reciveEntityRename payload: %s', vim.inspect(data))
+    if not data then return end
+    local id = data.entityId or data.entity_id or data.id or data[1]
+    local new_name = data.name or data.newName or data[2]
+    if not id or not new_name then
+      config.log('warn', 'reciveEntityRename: unexpected payload: %s', vim.inspect(data))
+      return
+    end
+    vim.schedule(function() M._apply_remote_rename(id, new_name) end)
+  end)
+
+  bridge.on_event('reciveEntityMove', function(data)
+    config.log('debug', 'reciveEntityMove payload: %s', vim.inspect(data))
+    if not data then return end
+    local id = data.entityId or data.entity_id or data.id
+    local parent_id = data.folderId or data.folder_id or data.parentFolderId
+    if not id then
+      config.log('warn', 'reciveEntityMove: unexpected payload: %s', vim.inspect(data))
+      return
+    end
+    vim.schedule(function() M._apply_remote_move(id, parent_id) end)
+  end)
+
   bridge.on_event('newComment', function(data)
     vim.schedule(function()
       require('overleaf.comments').on_new_comment(data)
@@ -771,6 +795,145 @@ function M._context_entry()
       end
     end
   end
+end
+
+local function no_slash(p)
+  local s = p:gsub('/+$', '')
+  return s
+end
+
+--- A collaborator renamed an entity: update the tree, the file/folder on disk,
+--- open documents (path, buffer name, watcher) and the tree window.
+function M._apply_remote_rename(entity_id, new_name)
+  local target
+  for _, e in ipairs(project._project_tree) do
+    if e.id == entity_id then
+      target = e
+      break
+    end
+  end
+  if not target then
+    config.log('debug', 'Remote rename for unknown entity %s', tostring(entity_id))
+    return
+  end
+  if target.name == new_name then return end -- already applied (e.g. our own rename echoed back)
+
+  local old_path = target.path
+
+  -- Snapshot everything affected (the entry itself, plus children for a folder)
+  local affected = {}
+  for _, e in ipairs(project._project_tree) do
+    if e == target or (target.type == 'folder' and e.path:sub(1, #old_path) == old_path) then
+      table.insert(affected, e)
+    end
+  end
+
+  -- Stop watchers of open/synced docs while their paths change
+  for _, e in ipairs(affected) do
+    local doc = M._state.documents[e.id]
+    if doc then sync.unwatch(doc) end
+  end
+
+  project.rename_entry(entity_id, new_name) -- mutates entries in place
+
+  -- Disk
+  local root = sync._sync_dir
+  if root then
+    local src = no_slash(root .. '/' .. old_path)
+    local dst = no_slash(root .. '/' .. target.path)
+    if vim.uv.fs_stat(src) then
+      if vim.uv.fs_stat(dst) then
+        config.log('warn', 'Remote rename: %s already exists on disk, left %s in place', dst, src)
+      else
+        local ok, err = vim.uv.fs_rename(src, dst)
+        if not ok then config.log('warn', 'Remote rename failed on disk: %s', tostring(err)) end
+      end
+    end
+  end
+
+  -- Documents: new path, buffer name, content on disk, watcher
+  for _, e in ipairs(affected) do
+    local doc = M._state.documents[e.id]
+    if doc then
+      doc.path = e.path
+      if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
+        pcall(vim.api.nvim_buf_set_name, doc.bufnr, sync.buf_name(doc.path))
+      end
+      if root and doc.content and vim.fn.filereadable(root .. '/' .. doc.path) ~= 1 then sync.write_doc(doc) end
+      sync.watch(doc)
+    elseif e.type == 'file' and root and vim.fn.filereadable(root .. '/' .. e.path) ~= 1 then
+      sync._download_file(e, M._state.project_id) -- binary that was not on disk yet
+    end
+  end
+
+  config.log('info', 'Renamed by collaborator: %s -> %s', no_slash(old_path), no_slash(target.path))
+  vim.schedule(function() require('overleaf.tree').refresh() end)
+end
+
+--- A collaborator moved an entity to another folder: update the tree, move the
+--- file/folder on disk, and fix open documents (path, buffer name, watcher).
+function M._apply_remote_move(entity_id, new_parent_id)
+  local target
+  for _, e in ipairs(project._project_tree) do
+    if e.id == entity_id then
+      target = e
+      break
+    end
+  end
+  if not target then
+    config.log('debug', 'Remote move for unknown entity %s', tostring(entity_id))
+    return
+  end
+
+  local old_path = target.path
+  local affected = {}
+  for _, e in ipairs(project._project_tree) do
+    if e == target or (target.type == 'folder' and e.path:sub(1, #old_path) == old_path) then
+      table.insert(affected, e)
+    end
+  end
+
+  for _, e in ipairs(affected) do
+    local doc = M._state.documents[e.id]
+    if doc then sync.unwatch(doc) end
+  end
+
+  local moved, from_path = project.move_entry(entity_id, new_parent_id)
+  if not moved then return end -- unchanged (e.g. our own move echoed back)
+
+  -- Disk
+  local root = sync._sync_dir
+  if root then
+    local src = no_slash(root .. '/' .. from_path)
+    local dst = no_slash(root .. '/' .. moved.path)
+    if vim.uv.fs_stat(src) then
+      if vim.uv.fs_stat(dst) then
+        config.log('warn', 'Remote move: %s already exists on disk, left %s in place', dst, src)
+      else
+        vim.fn.mkdir(vim.fn.fnamemodify(dst, ':h'), 'p')
+        local ok, err = vim.uv.fs_rename(src, dst)
+        if not ok then config.log('warn', 'Remote move failed on disk: %s', tostring(err)) end
+      end
+    end
+  end
+
+  -- Documents: new path, buffer name, content on disk, watcher
+  for _, e in ipairs(affected) do
+    local doc = M._state.documents[e.id]
+    if doc then
+      doc.path = e.path
+      if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
+        pcall(vim.api.nvim_buf_set_name, doc.bufnr, sync.buf_name(doc.path))
+      end
+      if root and doc.content and vim.fn.filereadable(root .. '/' .. doc.path) ~= 1 then sync.write_doc(doc) end
+      sync.watch(doc)
+    elseif e.type == 'file' and root and vim.fn.filereadable(root .. '/' .. e.path) ~= 1 then
+      sync._download_file(e, M._state.project_id)
+    end
+  end
+
+  config.log('info', 'Moved by collaborator: %s -> %s', no_slash(from_path), no_slash(moved.path))
+  vim.schedule(function() require('overleaf.tree').refresh() end)
 end
 
 function M.create_doc(name, parent_folder_id)

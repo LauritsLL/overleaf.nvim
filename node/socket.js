@@ -181,6 +181,14 @@ class SocketManager {
       this.sendEvent('reciveNewDoc', { parentFolderId, doc, meta: meta || {} });
     });
 
+    this.socket.on('reciveEntityRename', (entityId, name) => {
+      this.sendEvent('reciveEntityRename', { entityId, name });
+    });
+
+    this.socket.on('reciveEntityMove', (entityId, folderId) => {
+      this.sendEvent('reciveEntityMove', { entityId, folderId });
+    });
+
     this.socket.on('reciveNewFile', (parentFolderId, file, meta, userId) => {
       this.sendEvent('reciveNewFile', { parentFolderId, file, meta: meta || {} });
     });
